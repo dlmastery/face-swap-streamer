@@ -119,10 +119,15 @@ def _ensure_models():
     global _face_analyser, _swapper
     with _models_lock:
         if _face_analyser is None:
-            print("[webapp] loading face analyser (CUDA)...", flush=True)
+            # det_size 480 vs 640: detection runs ~1.7x faster at 480 with only
+            # a small drop in detection of small/profile faces. Detection is
+            # the slowest single GPU stage on RTX cards, so this is a big lever.
+            # If you find faces being missed in dance/wide shots, bump back to 640.
+            det_size = int(os.getenv("FACESWAP_DET_SIZE", "480"))
+            print(f"[webapp] loading face analyser (CUDA, det_size={det_size})...", flush=True)
             fa = FaceAnalysis(name="buffalo_l",
                               providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-            fa.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.4)
+            fa.prepare(ctx_id=0, det_size=(det_size, det_size), det_thresh=0.4)
             _face_analyser = fa
 
         if _swapper is None:
@@ -320,10 +325,12 @@ def _run_job(job: Job):
         # Writer: drains write_q into ffmpeg.stdin so the main loop never blocks
         # on the pipe. Both queues are bounded → memory is capped, full queues
         # provide natural backpressure.
-        # Q_DEPTH=32 → ~400 MB at 1080p (each queue holds raw BGR), plenty of
+        # Q_DEPTH=64 → ~800 MB at 1080p (each queue holds raw BGR), plenty of
         # slack for momentary read/write stalls (e.g. ffmpeg flushing a HLS
-        # segment every 2 s) while still bounded.
-        Q_DEPTH = 32
+        # segment every 2 s) while still bounded. With this much buffer the
+        # reader can run several seconds ahead of the swap loop, so the GPU
+        # is never starved by I/O hiccups.
+        Q_DEPTH = 64
         END = object()
         read_q: "queue.Queue[object]" = queue.Queue(maxsize=Q_DEPTH)
         write_q: "queue.Queue[object]" = queue.Queue(maxsize=Q_DEPTH)
