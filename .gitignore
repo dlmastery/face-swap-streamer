@@ -12,6 +12,7 @@ env/
 .vscode/
 .idea/
 .claude/
+.playwright-mcp/
 .DS_Store
 Thumbs.db
 

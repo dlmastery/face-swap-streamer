@@ -750,6 +750,24 @@ VIEWER_HTML = r"""<!doctype html><html lang="en"><head>
     animation: blink 1.4s ease-in-out infinite; }
   @keyframes blink { 50% { opacity: .3; } }
 
+  /* "Tap to unmute" overlay — required because browsers block autoplay-with-sound
+     until the user interacts. We start muted so video plays, and let the user
+     unmute with one click. */
+  .unmute-overlay { position:absolute; inset:0; display:none;
+    align-items:center; justify-content:center;
+    background: linear-gradient(135deg, rgba(0,0,0,.45), rgba(0,0,0,.15));
+    cursor:pointer; backdrop-filter: blur(2px); z-index:5; }
+  .unmute-overlay.show { display:flex; }
+  .unmute-overlay .btn {
+    display:flex; align-items:center; gap:.7rem; padding:.9rem 1.6rem;
+    background: rgba(20,26,42,0.85); color: var(--ink-0);
+    border-radius: 999px; font-weight:600; font-size:.95rem;
+    border: 1px solid rgba(255,255,255,.15);
+    box-shadow: 0 14px 40px rgba(0,0,0,.6);
+    transition: transform .12s; }
+  .unmute-overlay:hover .btn { transform: translateY(-2px); }
+  .unmute-overlay svg { width:20px; height:20px; }
+
   /* Progress + meta */
   .meta-row { width:100%; display:flex; flex-direction:column; gap:.6rem; }
   .progress { width:100%; height:6px; background: rgba(255,255,255,.06);
@@ -809,6 +827,12 @@ VIEWER_HTML = r"""<!doctype html><html lang="en"><head>
       </div>
     </div>
     <div class="audio-pill" id="audiopill"><span class="dot"></span>live · with audio</div>
+    <div class="unmute-overlay" id="unmute" title="Click to unmute">
+      <div class="btn">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+        Click to unmute
+      </div>
+    </div>
   </div>
 
   <div class="meta-row">
@@ -865,33 +889,108 @@ const PHASE_LABELS = {
 
 let hls = null;
 let streamShown = false;
+let playStarted = false;
+const PREBUFFER_TARGET = 15;   // seconds we want buffered ahead before pressing play
+const REBUFFER_TARGET = 8;     // when we stall, wait for this many seconds before resuming
+const unmuteOverlay = document.getElementById('unmute');
+
+function bufferedAhead() {
+  if (player.buffered.length === 0) return 0;
+  return player.buffered.end(player.buffered.length - 1) - player.currentTime;
+}
+
+function setPhaseMsg(text) { msgEl.textContent = text; }
+
+function tryStartPlayback() {
+  if (playStarted) return;
+  const ahead = bufferedAhead();
+  if (ahead >= PREBUFFER_TARGET) {
+    playStarted = true;
+    // Browsers block autoplay-with-audio. Start muted so play() works,
+    // then show the "Click to unmute" overlay.
+    player.muted = true;
+    player.play().then(() => {
+      unmuteOverlay.classList.add('show');
+      audioPill.classList.add('show');
+    }).catch(err => {
+      console.warn('play() failed:', err);
+      unmuteOverlay.classList.add('show');
+    });
+  } else {
+    setPhaseMsg(`Buffering ${ahead.toFixed(1)} / ${PREBUFFER_TARGET}s before starting…`);
+  }
+}
 
 function attachStream() {
   if (streamShown) return;
   const url = `/job/${JOB}/hls/playlist.m3u8`;
   if (window.Hls && Hls.isSupported()) {
     hls = new Hls({
-      liveSyncDuration: 4, liveMaxLatencyDuration: 12,
-      lowLatencyMode: false, manifestLoadingMaxRetry: 30,
-      manifestLoadingRetryDelay: 800, maxBufferLength: 30
+      // Bigger buffer because the swap pipeline produces frames slower than
+      // realtime — we want to soak up several seconds of slack.
+      liveSyncDuration: PREBUFFER_TARGET,
+      liveMaxLatencyDuration: 60,
+      maxBufferLength: 60,
+      maxMaxBufferLength: 120,
+      backBufferLength: 90,
+      lowLatencyMode: false,
+      manifestLoadingMaxRetry: 60,
+      manifestLoadingRetryDelay: 800,
+      levelLoadingMaxRetry: 60,
+      levelLoadingRetryDelay: 800,
+      fragLoadingMaxRetry: 60,
+      fragLoadingRetryDelay: 800,
     });
-    hls.loadSource(url); hls.attachMedia(player);
-    hls.on(Hls.Events.MANIFEST_PARSED, () => { player.play().catch(()=>{}); });
+    hls.loadSource(url);
+    hls.attachMedia(player);
+    // Don't auto-play on MANIFEST_PARSED — wait for buffer to fill instead.
+    hls.on(Hls.Events.BUFFER_APPENDED, tryStartPlayback);
     hls.on(Hls.Events.ERROR, (_, data) => {
       if (data.fatal) console.warn('hls fatal', data);
     });
   } else if (player.canPlayType('application/vnd.apple.mpegurl')) {
-    // Safari native
-    player.src = url; player.play().catch(()=>{});
+    // Safari native HLS — same buffer-then-play idea via timeupdate
+    player.src = url;
+    player.addEventListener('progress', tryStartPlayback);
   } else {
     errEl.classList.add('show');
     errEl.textContent = "Your browser doesn't support HLS. Try Chrome, Firefox, or Safari.";
     return;
   }
+
+  // Stall handling: when the buffer drains (backend can't keep up), pause and
+  // wait for a re-buffer instead of letting the player stutter every second.
+  player.addEventListener('waiting', () => {
+    if (playStarted) setPhaseMsg(`Buffering… (${bufferedAhead().toFixed(1)}s ahead)`);
+    prep.style.display = 'flex';
+  });
+  player.addEventListener('playing', () => {
+    prep.style.display = 'none';
+  });
+  // After a stall, only resume once we have REBUFFER_TARGET seconds again.
+  let resumeTimer = null;
+  player.addEventListener('waiting', () => {
+    if (resumeTimer) clearInterval(resumeTimer);
+    resumeTimer = setInterval(() => {
+      if (bufferedAhead() >= REBUFFER_TARGET) {
+        clearInterval(resumeTimer); resumeTimer = null;
+        player.play().catch(()=>{});
+      } else {
+        setPhaseMsg(`Re-buffering ${bufferedAhead().toFixed(1)} / ${REBUFFER_TARGET}s…`);
+      }
+    }, 500);
+  });
+
+  // Unmute overlay click → enable audio.
+  unmuteOverlay.addEventListener('click', () => {
+    player.muted = false;
+    player.volume = 1;
+    unmuteOverlay.classList.remove('show');
+  });
+
   player.classList.add('live');
-  prep.style.display = 'none';
-  audioPill.classList.add('show');
   streamShown = true;
+  setPhaseMsg(`Buffering 0 / ${PREBUFFER_TARGET}s before starting…`);
 }
 
 async function poll() {
@@ -928,8 +1027,11 @@ async function poll() {
 
   if (r.phase === "done") {
     audioPill.classList.remove('show');
+    unmuteOverlay.classList.remove('show');
     doneCard.classList.add('show');
     document.getElementById('dl').href = `/job/${JOB}/download`;
+    // Stream is finished — let the existing HLS playback continue (it now has
+    // the full playlist with #EXT-X-ENDLIST and acts as VOD with full scrub).
     return;
   }
   if (r.phase === "error") {
