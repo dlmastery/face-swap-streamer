@@ -91,18 +91,45 @@ _swapper = None
 
 
 def _ensure_models():
+    """Lazy-load the face analyser + inswapper. Called once on server start
+    (background thread) and again at the top of every job (no-op if already
+    loaded). The inswapper tries TensorRT first (30-50%% faster on RTX cards),
+    falling back to plain CUDA if the TRT engine build fails."""
     global _face_analyser, _swapper
     with _models_lock:
         if _face_analyser is None:
             print("[webapp] loading face analyser...", flush=True)
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            fa = FaceAnalysis(name="buffalo_l", providers=providers)
+            # Face analyser uses several models with dynamic shapes (det_10g
+            # has '?' in its input). TensorRT struggles with those, so we
+            # keep CUDA here. CUDA execution is fast enough for 640x640.
+            fa = FaceAnalysis(name="buffalo_l",
+                              providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
             fa.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.4)
             _face_analyser = fa
         if _swapper is None:
-            print("[webapp] loading inswapper...", flush=True)
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-            _swapper = insightface.model_zoo.get_model(SWAPPER_PATH, providers=providers)
+            # inswapper has a static 1x3x128x128 input — perfect for TRT engine
+            # caching. First call after a clean install builds the engine
+            # (~60-90s); cached afterwards.
+            trt_cache = os.path.join(JOBS_DIR, ".trt_cache")
+            os.makedirs(trt_cache, exist_ok=True)
+            providers = [
+                ("TensorrtExecutionProvider", {
+                    "trt_engine_cache_enable": True,
+                    "trt_engine_cache_path": trt_cache,
+                    "trt_fp16_enable": True,
+                    "trt_max_workspace_size": 2 * 1024 * 1024 * 1024,  # 2GB
+                }),
+                "CUDAExecutionProvider",
+                "CPUExecutionProvider",
+            ]
+            try:
+                print("[webapp] loading inswapper (TensorRT, building engine on first run)...", flush=True)
+                _swapper = insightface.model_zoo.get_model(SWAPPER_PATH, providers=providers)
+            except Exception as e:
+                print(f"[webapp] TensorRT load failed ({e}), falling back to CUDA", flush=True)
+                _swapper = insightface.model_zoo.get_model(
+                    SWAPPER_PATH,
+                    providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
 
 
 # ---- Job worker ------------------------------------------------------------
@@ -750,23 +777,28 @@ VIEWER_HTML = r"""<!doctype html><html lang="en"><head>
     animation: blink 1.4s ease-in-out infinite; }
   @keyframes blink { 50% { opacity: .3; } }
 
-  /* "Tap to unmute" overlay — required because browsers block autoplay-with-sound
-     until the user interacts. We start muted so video plays, and let the user
-     unmute with one click. */
-  .unmute-overlay { position:absolute; inset:0; display:none;
-    align-items:center; justify-content:center;
-    background: linear-gradient(135deg, rgba(0,0,0,.45), rgba(0,0,0,.15));
-    cursor:pointer; backdrop-filter: blur(2px); z-index:5; }
-  .unmute-overlay.show { display:flex; }
+  /* "Click to unmute" — small corner button, NOT a full-page overlay.
+     Browsers force us to start muted (autoplay+sound is blocked until the
+     user interacts). The video plays normally; this button just toggles audio. */
+  .unmute-overlay { position:absolute; bottom:1rem; left:1rem; display:none;
+    cursor:pointer; z-index:5; pointer-events:none; }
+  .unmute-overlay.show { display:block; }
   .unmute-overlay .btn {
-    display:flex; align-items:center; gap:.7rem; padding:.9rem 1.6rem;
-    background: rgba(20,26,42,0.85); color: var(--ink-0);
-    border-radius: 999px; font-weight:600; font-size:.95rem;
-    border: 1px solid rgba(255,255,255,.15);
-    box-shadow: 0 14px 40px rgba(0,0,0,.6);
-    transition: transform .12s; }
-  .unmute-overlay:hover .btn { transform: translateY(-2px); }
-  .unmute-overlay svg { width:20px; height:20px; }
+    display:inline-flex; align-items:center; gap:.55rem; padding:.65rem 1.1rem;
+    background: rgba(20,26,42,0.92); color: var(--ink-0);
+    border-radius: 999px; font-weight:600; font-size:.86rem;
+    border: 1px solid rgba(122,92,255,.5);
+    box-shadow: 0 14px 40px rgba(0,0,0,.6), 0 0 0 4px rgba(122,92,255,.15);
+    transition: transform .12s, box-shadow .12s;
+    pointer-events:auto;
+    animation: pulse-glow 2.4s ease-in-out infinite; }
+  .unmute-overlay:hover .btn { transform: translateY(-2px);
+    box-shadow: 0 18px 50px rgba(0,0,0,.7), 0 0 0 6px rgba(122,92,255,.25); }
+  .unmute-overlay svg { width:18px; height:18px; }
+  @keyframes pulse-glow {
+    0%,100% { box-shadow: 0 14px 40px rgba(0,0,0,.6), 0 0 0 4px rgba(122,92,255,.15); }
+    50%     { box-shadow: 0 14px 40px rgba(0,0,0,.6), 0 0 0 8px rgba(122,92,255,.35); }
+  }
 
   /* Progress + meta */
   .meta-row { width:100%; display:flex; flex-direction:column; gap:.6rem; }
@@ -813,7 +845,7 @@ VIEWER_HTML = r"""<!doctype html><html lang="en"><head>
 
 <main>
   <div class="stage">
-    <video id="player" playsinline controls></video>
+    <video id="player" playsinline controls muted autoplay></video>
     <div class="prep" id="prep">
       <div class="ring"></div>
       <div class="phase" id="phase">Loading…</div>
@@ -904,22 +936,39 @@ function setPhaseMsg(text) { msgEl.textContent = text; }
 function tryStartPlayback() {
   if (playStarted) return;
   const ahead = bufferedAhead();
-  if (ahead >= PREBUFFER_TARGET) {
+  setPhaseMsg(`Buffering ${ahead.toFixed(1)} / ${PREBUFFER_TARGET}s before starting…`);
+  if (ahead < PREBUFFER_TARGET) return;
+  // Browsers block autoplay-with-audio. Always start muted so play() succeeds.
+  player.muted = true;
+  player.play().then(() => {
+    // Only flip the flag *after* play() actually succeeds — otherwise a rejected
+    // promise (autoplay policy) would leave us stuck in "started" with paused video.
     playStarted = true;
-    // Browsers block autoplay-with-audio. Start muted so play() works,
-    // then show the "Click to unmute" overlay.
+    unmuteOverlay.classList.add('show');
+    audioPill.classList.add('show');
+    prep.style.display = 'none';
+  }).catch(err => {
+    console.warn('play rejected, retrying in 1s:', err && err.name);
+    // Retry — once user has interacted with the page (any click anywhere counts)
+    // the autoplay policy lifts and the next attempt will succeed.
+    setTimeout(tryStartPlayback, 1000);
+  });
+}
+
+// Any click on the stage counts as a user gesture for the autoplay policy.
+// This is the universal "rescue" path: if Chrome refuses to autoplay,
+// the user clicking anywhere on the player area will start it.
+document.addEventListener('click', () => {
+  if (!playStarted && bufferedAhead() >= 1) {
     player.muted = true;
     player.play().then(() => {
+      playStarted = true;
       unmuteOverlay.classList.add('show');
       audioPill.classList.add('show');
-    }).catch(err => {
-      console.warn('play() failed:', err);
-      unmuteOverlay.classList.add('show');
-    });
-  } else {
-    setPhaseMsg(`Buffering ${ahead.toFixed(1)} / ${PREBUFFER_TARGET}s before starting…`);
+      prep.style.display = 'none';
+    }).catch(()=>{});
   }
-}
+}, { once: false });
 
 function attachStream() {
   if (streamShown) return;
