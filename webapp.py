@@ -315,33 +315,50 @@ def _run_job(job: Job):
              message=f"Streaming swap (locked onto {gender} face from frame {job.ref_frame}) — audio is included")
         REFERENCE_THRESH = 0.22
 
-        # ---- Async writer thread ------------------------------------------------
-        # Frame bytes are pushed onto a bounded queue; one writer thread drains
-        # the queue into ffmpeg.stdin. Decouples the main loop's GPU work from
-        # the blocking pipe write. Queue size 8 caps memory at ~50 MB for 1080p.
-        WRITE_Q_DEPTH = 8
-        WRITE_END = object()
-        write_q: "queue.Queue[object]" = queue.Queue(maxsize=WRITE_Q_DEPTH)
+        # ---- Async reader + writer threads --------------------------------------
+        # Reader: cv2.read() into read_q so the main loop never blocks on decode.
+        # Writer: drains write_q into ffmpeg.stdin so the main loop never blocks
+        # on the pipe. Both queues are bounded → memory is capped, full queues
+        # provide natural backpressure.
+        # Q_DEPTH=32 → ~400 MB at 1080p (each queue holds raw BGR), plenty of
+        # slack for momentary read/write stalls (e.g. ffmpeg flushing a HLS
+        # segment every 2 s) while still bounded.
+        Q_DEPTH = 32
+        END = object()
+        read_q: "queue.Queue[object]" = queue.Queue(maxsize=Q_DEPTH)
+        write_q: "queue.Queue[object]" = queue.Queue(maxsize=Q_DEPTH)
         broken = False
+
+        def _reader_loop():
+            try:
+                while not job.stop_flag.is_set():
+                    ok, fr = cap.read()
+                    if not ok:
+                        break
+                    read_q.put(fr)
+            finally:
+                read_q.put(END)
 
         def _writer_loop():
             nonlocal broken
             while True:
                 item = write_q.get()
-                if item is WRITE_END:
+                if item is END:
                     return
                 try:
                     ffmpeg.stdin.write(item)
                 except (BrokenPipeError, OSError):
                     broken = True
-                    # Keep draining so the main loop's put() doesn't deadlock.
                     while True:
                         x = write_q.get()
-                        if x is WRITE_END:
+                        if x is END:
                             return
 
+        t_reader = threading.Thread(target=_reader_loop, daemon=True,
+                                    name=f"job-{job.id}-reader")
         t_writer = threading.Thread(target=_writer_loop, daemon=True,
                                     name=f"job-{job.id}-writer")
+        t_reader.start()
         t_writer.start()
 
         n = 0
@@ -354,9 +371,10 @@ def _run_job(job: Job):
                     raise RuntimeError("cancelled")
                 if broken:
                     break
-                ok, frame = cap.read()
-                if not ok:
+                item = read_q.get()
+                if item is END:
                     break
+                frame = item
                 n += 1
                 tgt_faces = fa.get(frame)
                 picked = None
@@ -375,6 +393,8 @@ def _run_job(job: Job):
 
                 # Hand off to the writer thread (will block if the queue is full,
                 # which is fine — provides natural backpressure on the pipeline).
+                if broken:
+                    break
                 write_q.put(frame.tobytes())
 
                 now = time.time()
@@ -385,9 +405,20 @@ def _run_job(job: Job):
                     job.proc_fps = n / elapsed if elapsed else 0.0
                     last_log = now
         finally:
-            # Always signal the writer to drain and exit, even on exceptions.
-            write_q.put(WRITE_END)
+            # Tell the writer to drain and exit, even on exceptions. The reader
+            # exits on its own when cap.read() returns False; if we're bailing
+            # early, set the stop_flag so it stops promptly on its next iter.
+            job.stop_flag.set()
+            # Drain any remaining items the reader might have queued so its
+            # final put(END) doesn't block on a full queue and hang join().
+            try:
+                while True:
+                    read_q.get_nowait()
+            except queue.Empty:
+                pass
+            write_q.put(END)
             t_writer.join(timeout=30)
+            t_reader.join(timeout=10)
             cap.release()
         # close ffmpeg cleanly so it writes the HLS endlist + finalises MP4
         try:
