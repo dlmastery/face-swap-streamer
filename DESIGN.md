@@ -8,40 +8,59 @@ this one tells you *why it's built that way*.
 
 ```
 ┌────────────────────────┐
-│  Browser (upload page) │  (HTML / JS / drag-drop / hls.js)
-└──────────┬─────────────┘
-           │ POST /start  (multipart: source.jpg + target.mp4)
+│  Browser (upload page) │  drag-and-drop two face slots + 1 video,
+└──────────┬─────────────┘  hls.js for live playback
+           │ POST /start  (multipart: source[]=face1.jpg, source[]=face2.jpg, target=video.mp4)
            ▼
 ┌────────────────────────┐
-│  Flask (webapp.py)     │  spawns a worker thread per job
+│  Flask (webapp.py)     │  spawns one orchestrator thread per job
 └──────────┬─────────────┘
            │
    ┌───────▼─────────────────────────────────────────────────┐
-   │  Worker thread                                          │
-   │  ─────────────                                          │
-   │  1. detect source face (insightface)  → gender, age     │
-   │  2. scan target video → cluster male/female embeddings  │
-   │     → pick most-recurring match → lock as `ref_emb`     │
-   │  3. spawn ffmpeg (raw BGR pipe in + target.mp4 in)      │
-   │  4. for each frame:                                     │
-   │       detect faces                                      │
-   │       pick face whose embedding · ref_emb is highest    │
-   │       inswapper.get(...) → swapped frame                │
-   │       ffmpeg.stdin.write(frame.tobytes())               │
+   │  _run_job orchestrator                                  │
+   │  • for each uploaded source: detect face, gender, age   │
+   │  • single video scan: collect every face's              │
+   │    (frame_idx, gender, embedding, area*det_score)       │
+   │  • per-source greedy cluster assignment — each source   │
+   │    claims the largest unused cluster of its gender,     │
+   │    so two F sources won't both target the same actress  │
+   │  • spawn ffmpeg (raw BGR pipe + target.mp4 audio        │
+   │    -> tee muxer -> HLS + fragmented MP4)                │
+   │  • spin up 4-stage pipeline threads                     │
+   └───────┬─────────────────────────────────────────────────┘
+           │
+   ┌───────▼─────────────────────────────────────────────────┐
+   │  4-stage pipeline (one thread each, queue.Queue(128))   │
+   │                                                         │
+   │   reader   ──(read_q)──▶  detect  ──(detect_q)──▶       │
+   │     │                       │                           │
+   │     │                       │                           │
+   │  cv2.read              fa.get + np.argmax               │
+   │  raw BGR               -> (frame, picks)                │
+   │                                                         │
+   │       main worker  ──(write_q)──▶  writer               │
+   │            │                          │                 │
+   │       sw.get per pick           ffmpeg.stdin.write      │
+   │       paste_back                                        │
    └───────┬─────────────────────────────────────────────────┘
            │
    ┌───────▼─────────────────────────────────────────────────┐
    │  ffmpeg (tee muxer)                                     │
-   │  ──────────────                                         │
-   │   • encode h264 + AAC (single pass)                     │
-   │   • output A: HLS playlist + .ts segments               │
-   │   • output B: fragmented MP4                            │
+   │   • h264 + AAC, one encode pass, two outputs            │
+   │   • output A: HLS playlist.m3u8 + seg_NNNNN.ts          │
+   │   • output B: fragmented MP4 (writeable progressively)  │
    └─┬──────────────────────────────────┬────────────────────┘
      │                                  │
      ▼                                  ▼
   /job/<id>/hls/playlist.m3u8     /job/<id>/download
-  (browser <video> via hls.js)    (final downloadable MP4)
+  (browser <video> via hls.js)    (muxed MP4 with audio)
 ```
+
+The pipeline has three bounded queues. With Q_DEPTH=128 and 1080p
+frames, that's ~1.6 GB total in-flight memory. With a fast SSD and
+RAM the reader runs ~5–10 s ahead of the swap, so the GPU is never
+starved by transient I/O hiccups (HLS segment flushes, page-cache
+writes, fa.get latency spikes).
 
 ## Why two conda envs?
 

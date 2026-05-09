@@ -511,7 +511,53 @@ before declaring the server dead.
 This only happens once per cache directory; the engine is then
 serialised to `webapp_jobs/.trt_cache/` and reused.
 
-### 11. Browser autoplay rescue (UX, not a crash)
+### 12. Pipeline thread coordination
+
+The 4-stage pipeline (`reader → detect → swap → writer`) uses three
+`queue.Queue(maxsize=128)` between stages. Things that broke before:
+
+- **Reader put() blocked on full queue while we tried to join it** →
+  always drain upstream queues in the `finally:` block before joining
+  threads, otherwise the join times out.
+- **Setting a `playStarted=true` flag *before* the play() promise
+  resolved** (analogous to setting "broken=true" before pipe write
+  succeeds). Always flip the success flag *after* the operation
+  resolves, in the success branch.
+- **Sending END to the wrong queue at exit** — each stage forwards
+  END to the next. Reader puts END on read_q; detector pops END,
+  forwards to detect_q; main loop pops END from detect_q, then puts
+  END on write_q for the writer.
+
+The `_run_job` finally block:
+1. `job.stop_flag.set()` — reader notices on next iter and exits
+2. drain `read_q` and `detect_q` (best-effort) so any blocked put()s
+   unblock and propagate END
+3. `write_q.put(END)` — writer drains and exits
+4. `t_writer.join(timeout=30)` then `t_detect.join(timeout=10)`
+   then `t_reader.join(timeout=10)` — must be in this order so that
+   any frames in flight reach ffmpeg before we close cap
+5. `cap.release()`
+
+### 13. Multi-source matching
+
+`Job.sources` is a list of `SourceSpec` (path, gender, age,
+src_face, ref_emb, ref_frame, ref_votes, ref_pool). The form has two
+file inputs both with `name="source"`; Flask's
+`request.files.getlist("source")` collects them. Per-frame, the
+detector stacks all detected faces' embeddings into `(T, D)`,
+multiplies by the pre-stacked `(S, D)` source references → `(T, S)`
+similarity matrix; argmax per target row picks the matching source
+(if it clears `REFERENCE_THRESH=0.22`). Each source can swap
+multiple faces per frame (e.g. crowd shots), each face matches its
+single best source.
+
+Same-gender second source: the auto-extract is greedy — it claims
+the largest cluster of its gender, then masks those candidates so
+the next same-gender source picks a different cluster. Works for two
+distinct people of the same gender; degrades to "first source claims
+the lead" when the video only has one matching-gender person.
+
+### 14. Browser autoplay rescue (UX, not a crash)
 
 `<video>.play()` can be silently rejected by the browser's autoplay
 policy if the user hasn't interacted with the page yet — even when
@@ -581,44 +627,100 @@ document.addEventListener('click', () => {
 
 ## Performance + GPU memory
 
-Observed on RTX 4090 Laptop (16 GB VRAM):
+Observed on RTX 4090 Laptop (16 GB VRAM), 640×480 Bollywood mp4 with
+TRT enabled, walking through the speedup history:
 
-| Resolution | CUDA-only fps | TensorRT FP16 fps | VRAM |
+| commit | what's in the loop | proc fps | GPU avg util |
 |---|---|---|---|
-| 480×360  | 25-30 | 35-45 | 4.5 GB |
-| 640×480  | 18-22 | 28-35 | 4.8 GB |
-| 1280×720 | 8-12  | 14-20 | 5.5 GB |
-| 1920×1080| 5-8   | 9-13  | 6.2 GB |
+| serial baseline    | cv2.read → fa.get → sw.get → ffmpeg.write all on one thread |  7.5 | ~17 % |
+| `8735818` writer thread       | + async `ffmpeg.stdin.write` thread        | 10.1 | ~17 % |
+| `660e7d1` reader thread + Q=32| + async `cv2.read` thread                  | 10.8 | ~17 % |
+| `0a966ce` det 480 + Q=64      | + 480 detector input + bigger queues       | 11.7 | ~18 % |
+| `2a0e0dd` multi-face          | + 1-or-2-source matching, batched embed   | 12+  | ~18 % |
+| `d4fc024` 4-stage pipeline    | + dedicated detect thread, Q=128          | 12+  | ~18 % |
 
-Bottleneck is `inswapper_128` inference (the 128×128 swap, then
-`paste_back=True`'s warp). InsightFace face detection is faster.
+Total: about **+60 % throughput** with the same model + same detector
+input, vs the serial baseline. After this point GPU is no longer the
+bottleneck on this workload — average util sits around 18 % and only
+peaks briefly. Further gains would need a bigger model (so the GPU
+actually has more work) or a different I/O path (NVDEC, zero-copy
+to ffmpeg).
 
-### TensorRT (recommended on RTX cards)
+Theoretical ceiling at higher resolutions on the same hardware:
 
-If `tensorrt-cu12` is installed in the env (it's listed in
-`requirements-webapp.txt`), `webapp.py` automatically uses TensorRT for
-the inswapper. First run builds the engine (~60–90 s); cached to
-`webapp_jobs/.trt_cache/` thereafter. Worth ~30–50 % throughput uplift.
+| Resolution | observed fps | est. GPU util |
+|---|---|---|
+| 480×360  | 30-45  | ~25 % |
+| 640×480  | 18-25  | ~20 % |
+| 1280×720 | 12-18  | ~30 % |
+| 1920×1080| 8-13   | ~40 % |
 
-Install (if missing):
+Bottleneck per-frame breakdown at 1080p (rough):
+- `cv2.VideoCapture.read` ~3-5 ms (CPU decode)
+- `fa.get` ~10-15 ms (GPU detect — biggest)
+- per-face `sw.get` ~5-10 ms (GPU swap)
+- `frame.tobytes()` ~3-5 ms (CPU memcpy)
+- `ffmpeg.stdin.write` ~1-3 ms (pipe + ffmpeg encode)
+- Python glue ~1-2 ms (queue puts/gets, attribute access, GIL switching)
+
+Total ~25-40 ms/frame → 25-40 fps theoretical, observed ~10-13 fps —
+the 2× gap is GIL serialisation between threads + ORT serialising GPU
+calls across stages.
+
+### Defaults that *are* enabled
+
+- **TensorRT** for the inswapper if `tensorrt-cu12` is installed in
+  the env (it's listed in `requirements-webapp.txt`). First run
+  builds an engine (~60–90 s); cached to `webapp_jobs/.trt_cache/`
+  per-architecture (e.g. `..._sm89.engine` for RTX 4090). Worth
+  ~30–50 % uplift on the swap step. If `tensorrt` isn't present we
+  stay on CUDA — never CPU (see issue #8).
+- **det_size=480** for face detection (env: `FACESWAP_DET_SIZE`).
+  ~1.7× faster than the model's native 640.
+- **4-stage pipeline**: reader → detect → swap → writer threads with
+  `queue.Queue(maxsize=128)` between them. Reader runs ~5–10 s ahead
+  of swap so GPU isn't starved by I/O hiccups.
+
+Install TRT (if missing):
 ```powershell
 conda run -n dlc pip install tensorrt-cu12
 ```
-~2 GB download. Restart `webapp.py` — it'll auto-detect.
 
-If TRT is **not** present, the code stays on CUDA-only (don't let it
-fall back to CPU; see issue #8).
+### Tuning knobs (env vars)
 
-### Other speedups (not enabled by default)
+| var | default | what it does |
+|---|---|---|
+| `FACESWAP_FACE_MODEL` | `buffalo_l` | Face analyser bundle. `buffalo_s` is ~2× faster but produced visible quality regression on test footage; left as opt-in. |
+| `FACESWAP_DET_SIZE`   | `480`       | Face detector input (square). 640 = native, slower; 320 = even faster, misses small faces. |
 
-- **NVDEC for video decode** — `cv2.VideoCapture` is software decode.
-  Switch to PyAV with `hwaccel=cuda` for ~10–20 % I/O savings.
-- **Lower `det_size` to 480** — face detector input. Faster, may miss
-  small faces in dance/wide shots.
-- **Smaller face model `buffalo_s`** — ~2× faster than `buffalo_l`,
-  slightly lower accuracy.
-- **Frame-skip + interpolate** — process every 2nd frame, copy swap to
-  the in-between. Doubles speed; visible artefacts on fast cuts.
+### Tried-and-rejected speedups
+
+- **`buffalo_s` face model** (env-toggle still works): less accurate
+  embeddings → more reference-match misses → visible swap flicker
+  on tested footage. Worth re-trying on cleaner sources.
+- **CUDA Graph capture in TRT** (`trt_cuda_graph_enable: True`): no
+  measurable gain on this workload, and it triggered a regression in
+  one earlier broken commit. Disabled.
+- **Frame-skip + interpolate**: process every 2nd frame, copy swap to
+  in-between. Doubles speed but visible artefacts on fast cuts —
+  unacceptable for music videos.
+
+### Speedups still on the table
+
+- **NVDEC for video decode** — `cv2.VideoCapture` does software
+  decode. Switching to PyAV with `hwaccel=cuda`, or piping ffmpeg
+  with `-hwaccel cuda` to a numpy buffer, would save the 3–5 ms/frame
+  CPU decode + an unnecessary CPU→GPU memcpy.
+- **Avoid `frame.tobytes()`** — currently 3–5 ms memcpy per 1080p
+  frame to convert numpy → bytes for ffmpeg. Could pass the numpy
+  buffer directly via `ffmpeg.stdin.write(frame.data)` (zero-copy of
+  the underlying memory).
+- **TRT for the static-shape sub-models** of the face analyser
+  (`genderage`, `w600k_r50`, `2d106det`). Detection sub-model has
+  dynamic shapes and stays on CUDA.
+- **Multiprocessing** if the GIL becomes the floor: split detect
+  and swap into separate processes with shared-memory frame buffers.
+  Bigger refactor.
 
 ---
 

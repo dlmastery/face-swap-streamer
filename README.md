@@ -1,10 +1,13 @@
 # Faceswap streamer
 
-> Drop a photo of yourself + a video. The web app auto-detects your face's
-> gender, locks onto the matching person in the footage, and **streams the
-> swap live to your browser with synchronised audio** — frame by frame, while
-> it's still being processed. When the run finishes, you can download the
-> finished MP4.
+> Drop a photo of yourself (or two — one per duet lead) + a video. The web app
+> auto-detects each face's gender, locks onto the matching person in the footage,
+> and **streams the swap live to your browser with synchronised audio** — frame
+> by frame, while it's still being processed. When the run finishes, you can
+> download the finished MP4.
+
+Latest perf on RTX 4090 with TensorRT inswapper + 4-stage thread pipeline:
+8–13 fps on 1080p, 18–25 fps on 480p, audio in the live stream.
 
 A self-contained Windows + NVIDIA stack built around three open-source
 face-swap tools, with a Flask web app on top for live HLS streaming.
@@ -84,17 +87,27 @@ models).
 conda run -n dlc python webapp.py
 ```
 
-Open <http://localhost:8080/> and drag in a face image + a video. The page
+Open <http://localhost:8080/> and drag in a face image (Face #1, required) and
+optionally a second one (Face #2, for duet swaps). Pick a video. The page
 shows a phase spinner while the workflow runs:
 
-1. **load models** — face analyser + inswapper into VRAM (one-time, ~30 s)
-2. **detect your face** — gender/age detection from the source image
-3. **find target person** — scans the target video for the matching-gender
-   face that recurs across the most frames; locks onto its embedding
-4. **stream** — HLS player appears, audio plays, swap is happening live
+1. **load models** — face analyser + inswapper into VRAM (one-time, ~30 s
+   model warmup; one-time ~60–90 s TensorRT engine build on first run)
+2. **detect your face** — gender/age detection from each uploaded source
+3. **find target person** — single video scan extracts a reference cluster
+   per source: each one is matched to the largest unused cluster of its
+   gender (so two leads of a duet won't compete for the same target)
+4. **stream** — HLS player appears, audio plays from the start, swap is
+   happening live frame-by-frame, pre-buffer 15 s before playback so it
+   doesn't stall when processing dips below realtime
 5. **finalise** — ffmpeg writes the HLS endlist marker + closes the MP4
 
-When the run completes, a "Download MP4 (with audio)" card appears.
+When the run completes, the "Download MP4 (with audio)" card appears and
+the player swaps to the muxed file (full scrub bar, replay).
+
+The live stream starts muted because browsers block autoplay-with-sound
+without a user gesture; click the small "🔊 Click to unmute" pill in the
+bottom-left of the player to turn audio on.
 
 ### FaceFusion CLI (Path A — best quality)
 

@@ -135,13 +135,17 @@ def _ensure_models():
     global _face_analyser, _swapper
     with _models_lock:
         if _face_analyser is None:
-            # det_size 480 vs 640: detection runs ~1.7x faster at 480 with only
-            # a small drop in detection of small/profile faces. Detection is
-            # the slowest single GPU stage on RTX cards, so this is a big lever.
-            # If you find faces being missed in dance/wide shots, bump back to 640.
+            # Default is buffalo_l — the smaller buffalo_s gave noticeable
+            # swap-quality regression on this workload (less accurate
+            # embeddings → more reference-match misses → flicker). The env
+            # var stays so it's a one-line opt-in for anyone GPU-bound.
+            #
+            # det_size 480 (vs the model's native 640) is a safe ~1.7x
+            # speedup on the detector with only a small drop on tiny faces.
+            face_model = os.getenv("FACESWAP_FACE_MODEL", "buffalo_l")
             det_size = int(os.getenv("FACESWAP_DET_SIZE", "480"))
-            print(f"[webapp] loading face analyser (CUDA, det_size={det_size})...", flush=True)
-            fa = FaceAnalysis(name="buffalo_l",
+            print(f"[webapp] loading face analyser (CUDA, model={face_model}, det_size={det_size})...", flush=True)
+            fa = FaceAnalysis(name=face_model,
                               providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
             fa.prepare(ctx_id=0, det_size=(det_size, det_size), det_thresh=0.4)
             _face_analyser = fa
