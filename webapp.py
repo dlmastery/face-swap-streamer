@@ -64,14 +64,30 @@ FFMPEG_EXE = next((p for p in [
 # ---- Job state -------------------------------------------------------------
 
 @dataclass
+class SourceSpec:
+    """One source image + its detected face, gender, and the video-side reference
+    cluster that targets matching this source will be swapped onto."""
+    path: str
+    gender: str = ""        # 'M' or 'F'
+    age: int = 0
+    src_face: object = None        # insightface Face object — kept alive
+    ref_emb: object = None         # numpy embedding of the matching cluster centroid
+    ref_frame: int = -1
+    ref_votes: int = 0
+    ref_pool: int = 0
+
+
+@dataclass
 class Job:
     id: str
-    source_path: str
+    source_path: str             # primary source for back-compat (= sources[0].path)
     target_path: str
     out_audio_path: str          # final audio-muxed MP4 (download)
     hls_dir: str                 # dir holding playlist.m3u8 + seg_*.ts
+    sources: list = field(default_factory=list)   # list[SourceSpec], one per uploaded face
     phase: str = "queued"
     message: str = "Queued"
+    # Back-compat fields for the status JSON — these mirror sources[0]
     detected_gender: str = ""
     detected_age: int = 0
     ref_frame: int = -1
@@ -261,16 +277,24 @@ def _run_job(job: Job):
         fa = _face_analyser
         sw = _swapper
 
-        _set(job, phase="detecting_source", message="Detecting your face in the source image…")
-        src_bgr = cv2.imread(job.source_path)
-        if src_bgr is None:
-            raise RuntimeError("could not read source image")
-        src_faces = fa.get(src_bgr)
-        if not src_faces:
-            raise RuntimeError("no face detected in source image — try a clearer, front-facing photo")
-        src_face = max(src_faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
-        gender = src_face.sex
-        _set(job, detected_gender=gender, detected_age=int(src_face.age))
+        # Migrate older Job objects (no .sources) to the new shape transparently
+        if not job.sources:
+            job.sources = [SourceSpec(path=job.source_path)]
+
+        _set(job, phase="detecting_source",
+             message=f"Detecting face{'s' if len(job.sources) > 1 else ''} in the source image{'s' if len(job.sources) > 1 else ''}…")
+        for spec in job.sources:
+            src_bgr = cv2.imread(spec.path)
+            if src_bgr is None:
+                raise RuntimeError(f"could not read source image: {os.path.basename(spec.path)}")
+            src_faces = fa.get(src_bgr)
+            if not src_faces:
+                raise RuntimeError(f"no face detected in {os.path.basename(spec.path)} — try a clearer, front-facing photo")
+            spec.src_face = max(src_faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * (f.bbox[3] - f.bbox[1]))
+            spec.gender = spec.src_face.sex
+            spec.age = int(spec.src_face.age)
+        # Mirror primary source into top-level fields (status JSON back-compat)
+        _set(job, detected_gender=job.sources[0].gender, detected_age=job.sources[0].age)
 
         cap = cv2.VideoCapture(job.target_path)
         if not cap.isOpened():
@@ -281,44 +305,85 @@ def _run_job(job: Job):
         total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
         _set(job, width=in_w, height=in_h, fps=float(fps), total_frames=total)
 
-        # auto-extract reference embedding
+        # ---- Per-source auto-reference extraction ------------------------------
+        # Single video scan: collect every detected face + its gender + bbox
+        # score. Then per-source, pick the largest cluster of matching-gender
+        # faces. Same-gender sources are assigned different clusters so e.g.
+        # two F sources won't both target the same actress.
+        genders_needed = set(s.gender for s in job.sources)
         _set(job, phase="finding_reference",
-             message=f"Scanning video for the {gender} face to swap onto…")
+             message=f"Scanning video for {' + '.join(sorted(genders_needed))} face{'s' if len(genders_needed) > 1 else ''} to swap onto…")
         step = max(1, int(fps * 2.0))
-        candidates = []
+        # all_candidates: list of (score, embedding, frame_idx, gender)
+        all_candidates: list = []
         i = 0
-        while i < total and len(candidates) < 60:
+        max_samples = 80
+        while i < total and len(all_candidates) < max_samples:
             if job.stop_flag.is_set():
                 raise RuntimeError("cancelled")
             cap.set(cv2.CAP_PROP_POS_FRAMES, i)
             ok, fr = cap.read()
             if not ok:
                 break
-            faces = [f for f in fa.get(fr) if f.sex == gender]
-            if faces:
-                best = max(faces, key=lambda f: (f.bbox[2] - f.bbox[0]) * f.det_score)
-                if (best.bbox[2] - best.bbox[0]) >= 50:
-                    candidates.append((float((best.bbox[2] - best.bbox[0]) * best.det_score),
-                                       best.normed_embedding, i))
+            for face in fa.get(fr):
+                if face.sex not in genders_needed:
+                    continue
+                w_face = face.bbox[2] - face.bbox[0]
+                if w_face < 50:
+                    continue
+                all_candidates.append((float(w_face * face.det_score),
+                                       face.normed_embedding, i, face.sex))
             i += step
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-        if not candidates:
-            raise RuntimeError(f"no {gender} face found in the video")
 
-        embs = np.stack([c[1] for c in candidates])
-        sim = embs @ embs.T
-        votes = (sim > 0.30).sum(axis=1)
-        winner = int(np.argmax(votes * np.array([c[0] for c in candidates])))
-        ref_emb = candidates[winner][1]
-        _set(job, ref_frame=int(candidates[winner][2]),
-             ref_votes=int(votes[winner]), ref_pool=len(candidates))
+        # For each gender, cluster candidates and pick top clusters (one per
+        # source of that gender).
+        used_idxs: set = set()
+        for gender in genders_needed:
+            same_gender = [(idx, c) for idx, c in enumerate(all_candidates) if c[3] == gender]
+            sources_this_gender = [s for s in job.sources if s.gender == gender]
+            if not same_gender:
+                raise RuntimeError(f"no {gender} face found in the video")
+            embs = np.stack([c[1] for _, c in same_gender])
+            sim = embs @ embs.T
+            scores = np.array([c[0] for _, c in same_gender])
+            for spec in sources_this_gender:
+                # Mask out candidates already claimed by another source.
+                mask = np.array([1.0 if i not in used_idxs else 0.0
+                                 for i, _ in same_gender])
+                if mask.sum() == 0:
+                    # no fresh cluster left — reuse the best one
+                    mask = np.ones(len(same_gender))
+                # Vote count per candidate, weighted by score, masked.
+                votes = (sim > 0.30).sum(axis=1) * scores * mask
+                local_winner = int(np.argmax(votes))
+                global_idx, cand = same_gender[local_winner]
+                spec.ref_emb = cand[1]
+                spec.ref_frame = int(cand[2])
+                spec.ref_votes = int((sim[local_winner] > 0.30).sum())
+                spec.ref_pool = len(same_gender)
+                # Mark all candidates similar to this winner as "used"
+                similar = sim[local_winner] > 0.30
+                for j, (gidx, _) in enumerate(same_gender):
+                    if similar[j]:
+                        used_idxs.add(gidx)
+        # Mirror primary source's ref into top-level fields (back-compat)
+        primary = job.sources[0]
+        _set(job, ref_frame=primary.ref_frame, ref_votes=primary.ref_votes,
+             ref_pool=primary.ref_pool)
 
         # ffmpeg HLS+MP4 pipeline
         ffmpeg = _spawn_ffmpeg(job, in_w, in_h, fps)
 
+        msg_genders = ", ".join(f"{s.gender}@frame{s.ref_frame}" for s in job.sources)
         _set(job, phase="streaming",
-             message=f"Streaming swap (locked onto {gender} face from frame {job.ref_frame}) — audio is included")
+             message=f"Streaming swap ({len(job.sources)} source{'s' if len(job.sources) > 1 else ''}: {msg_genders}) — audio is included")
         REFERENCE_THRESH = 0.22
+
+        # Pre-stack reference embeddings for fast per-frame matching against
+        # all sources at once.
+        ref_embs = np.stack([s.ref_emb for s in job.sources])  # shape (S, D)
+        ref_sources = list(job.sources)                        # parallel index
 
         # ---- Async reader + writer threads --------------------------------------
         # Reader: cv2.read() into read_q so the main loop never blocks on decode.
@@ -384,19 +449,22 @@ def _run_job(job: Job):
                 frame = item
                 n += 1
                 tgt_faces = fa.get(frame)
-                picked = None
-                best_sim = -1.0
-                for f in tgt_faces:
-                    s = float(np.dot(f.normed_embedding, ref_emb))
-                    if s > best_sim:
-                        best_sim = s
-                        picked = f
-                if best_sim < REFERENCE_THRESH:
-                    picked = None
-
-                if picked is not None:
-                    frame = sw.get(frame, picked, src_face, paste_back=True)
-                    swap_count += 1
+                # For each detected face, pick the best-matching source (if
+                # any clear it the threshold). A face that doesn't clearly
+                # belong to any uploaded source passes through untouched.
+                # Greedy assignment: each source can swap multiple faces in a
+                # frame (e.g. crowd shots), each face matches its single best
+                # source.
+                if tgt_faces:
+                    tgt_embs = np.stack([f.normed_embedding for f in tgt_faces])  # (T, D)
+                    sims = tgt_embs @ ref_embs.T                                    # (T, S)
+                    for ti, tface in enumerate(tgt_faces):
+                        si = int(np.argmax(sims[ti]))
+                        if float(sims[ti, si]) < REFERENCE_THRESH:
+                            continue
+                        frame = sw.get(frame, tface, ref_sources[si].src_face,
+                                       paste_back=True)
+                        swap_count += 1
 
                 # Hand off to the writer thread (will block if the queue is full,
                 # which is fine — provides natural backpressure on the pipeline).
@@ -607,6 +675,11 @@ INDEX_HTML = r"""<!doctype html><html lang="en"><head>
     50% { opacity:1; transform: translateX(6px); }
   }
 
+  .sources-stack { display:flex; flex-direction:column; gap:.7rem; }
+  .req { color: #ff8aa3; font-weight:500; font-size:.78rem; margin-left:.3rem; }
+  .opt { color: var(--ink-2); font-weight:500; font-size:.78rem; margin-left:.3rem; }
+  .drop-secondary { min-height: 140px; opacity:.85; }
+  .drop-secondary:hover { opacity:1; }
   .drop {
     position:relative; border:2px dashed rgba(255,255,255,.12);
     border-radius:18px; padding:1.6rem;
@@ -694,16 +767,28 @@ INDEX_HTML = r"""<!doctype html><html lang="en"><head>
 
   <form class="card" action="/start" method="POST" enctype="multipart/form-data" id="f">
     <div class="drop-row">
-      <label class="drop" id="d_source">
-        <div class="icon">
-          <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0 1 16 0v1"/></svg>
-        </div>
-        <div class="label">Your face</div>
-        <div class="hint" id="h_source">PNG, JPG · 1024 px+ recommended</div>
-        <div class="preview" id="p_source" style="display:none"><img alt=""></div>
-        <div class="filename" id="n_source"></div>
-        <input type="file" name="source" id="source" accept="image/*" required>
-      </label>
+      <div class="sources-stack">
+        <label class="drop" id="d_source">
+          <div class="icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0 1 16 0v1"/></svg>
+          </div>
+          <div class="label">Face #1 <span class="req">(required)</span></div>
+          <div class="hint" id="h_source">PNG, JPG · 1024 px+ recommended</div>
+          <div class="preview" id="p_source" style="display:none"><img alt=""></div>
+          <div class="filename" id="n_source"></div>
+          <input type="file" name="source" id="source" accept="image/*" required>
+        </label>
+        <label class="drop drop-secondary" id="d_source2">
+          <div class="icon">
+            <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="8" r="4"/><path d="M4 21v-1a8 8 0 0 1 16 0v1"/></svg>
+          </div>
+          <div class="label">Face #2 <span class="opt">(optional)</span></div>
+          <div class="hint" id="h_source2">For duets — swap both leads</div>
+          <div class="preview" id="p_source2" style="display:none"><img alt=""></div>
+          <div class="filename" id="n_source2"></div>
+          <input type="file" name="source" id="source2" accept="image/*">
+        </label>
+      </div>
 
       <div class="arrow" aria-hidden="true">
         <svg width="40" height="40" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
@@ -789,8 +874,9 @@ function setupDrop(zoneId, inputId, previewId, nameId, hintId, isVideo) {
     show(f);
   });
 }
-setupDrop('d_source', 'source', 'p_source', 'n_source', 'h_source', false);
-setupDrop('d_target', 'target', 'p_target', 'n_target', 'h_target', true);
+setupDrop('d_source',  'source',  'p_source',  'n_source',  'h_source',  false);
+setupDrop('d_source2', 'source2', 'p_source2', 'n_source2', 'h_source2', false);
+setupDrop('d_target',  'target',  'p_target',  'n_target',  'h_target',  true);
 
 document.getElementById('f').addEventListener('submit', () => {
   const b = document.getElementById('go');
@@ -1170,7 +1256,13 @@ async function poll() {
   phaseEl.textContent = PHASE_LABELS[r.phase] || r.phase;
   msgEl.textContent = r.message;
 
-  if (r.detected_gender) {
+  if (r.sources && r.sources.length) {
+    const parts = r.sources.map((s, i) => {
+      const ref = s.ref_frame >= 0 ? ` (f${s.ref_frame}, ${s.ref_votes}/${s.ref_pool})` : '';
+      return `<span class="k">src${i + 1}</span> <span class="v">${s.gender}/${s.age}</span><span class="k">${ref}</span>`;
+    });
+    document.getElementById('m_extra').innerHTML = parts.join(' &nbsp;&nbsp; ');
+  } else if (r.detected_gender) {
     document.getElementById('m_extra').innerHTML =
       `<span class="k">source</span> <span class="v">${r.detected_gender}/${r.detected_age}</span>` +
       (r.ref_frame >= 0 ? ` &nbsp; <span class="k">ref</span> <span class="v">f${r.ref_frame} (${r.ref_votes}/${r.ref_pool})</span>` : '');
@@ -1217,28 +1309,36 @@ def index():
 
 @app.route("/start", methods=["POST"])
 def start():
-    src = request.files.get("source")
+    # `source` is multi-valued: user can upload 1+ face images. The first one
+    # is the primary (back-compat) but every uploaded source gets matched
+    # against its own video-side reference, so duets can swap both leads.
+    src_files = [f for f in request.files.getlist("source") if f and f.filename]
     tgt = request.files.get("target")
-    if not src or not tgt:
+    if not src_files or not tgt:
         return "missing source or target", 400
 
     job_id = uuid.uuid4().hex[:12]
     job_dir = os.path.join(JOBS_DIR, job_id)
     os.makedirs(job_dir, exist_ok=True)
 
-    src_ext = os.path.splitext(src.filename or "src.jpg")[1].lower() or ".jpg"
+    saved_src_paths = []
+    for i, src in enumerate(src_files):
+        ext = os.path.splitext(src.filename or f"src{i}.jpg")[1].lower() or ".jpg"
+        p = os.path.join(job_dir, f"source_{i}{ext}")
+        src.save(p)
+        saved_src_paths.append(p)
+
     tgt_ext = os.path.splitext(tgt.filename or "tgt.mp4")[1].lower() or ".mp4"
-    src_path = os.path.join(job_dir, "source" + src_ext)
     tgt_path = os.path.join(job_dir, "target" + tgt_ext)
-    src.save(src_path)
     tgt.save(tgt_path)
 
     job = Job(
         id=job_id,
-        source_path=src_path,
+        source_path=saved_src_paths[0],
         target_path=tgt_path,
         out_audio_path=os.path.join(job_dir, "swapped.mp4"),
         hls_dir=os.path.join(job_dir, "hls"),
+        sources=[SourceSpec(path=p) for p in saved_src_paths],
     )
     with JOBS_LOCK:
         JOBS[job_id] = job
@@ -1258,6 +1358,16 @@ def status(job_id: str):
     job = JOBS.get(job_id)
     if not job:
         return jsonify({"phase": "error", "message": "no such job"}), 404
+    sources = [
+        {
+            "gender": s.gender,
+            "age": s.age,
+            "ref_frame": s.ref_frame,
+            "ref_votes": s.ref_votes,
+            "ref_pool": s.ref_pool,
+        }
+        for s in (job.sources or [])
+    ]
     return jsonify({
         "phase": job.phase,
         "message": job.message,
@@ -1266,6 +1376,7 @@ def status(job_id: str):
         "ref_frame": job.ref_frame,
         "ref_votes": job.ref_votes,
         "ref_pool": job.ref_pool,
+        "sources": sources,
         "current_frame": job.current_frame,
         "total_frames": job.total_frames,
         "swap_count": job.swap_count,
