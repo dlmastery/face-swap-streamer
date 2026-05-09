@@ -594,10 +594,13 @@ def too_large(_):
 
 
 def _cleanup_old_jobs(keep_hours: float = 6.0) -> None:
-    """Remove job dirs older than keep_hours so disk doesn't fill up."""
+    """Remove job dirs older than keep_hours so disk doesn't fill up.
+    Preserves anything starting with '.' (e.g. .trt_cache)."""
     cutoff = time.time() - keep_hours * 3600
     try:
         for d in os.listdir(JOBS_DIR):
+            if d.startswith("."):
+                continue
             full = os.path.join(JOBS_DIR, d)
             if not os.path.isdir(full):
                 continue
@@ -609,6 +612,43 @@ def _cleanup_old_jobs(keep_hours: float = 6.0) -> None:
                 pass
     except Exception:
         pass
+
+
+def _cleanup_finished_jobs() -> None:
+    """Wipe every previous job dir on disk EXCEPT:
+      - anything starting with '.' (the TRT engine cache lives here, ~265 MB
+        per architecture — it takes 60-90 s to rebuild so we keep it)
+      - any job currently still running (phase != done/error)
+
+    Called at the top of /start so each new upload begins from a clean slate
+    — no old HLS segments, no old swapped.mp4, no leftover source images."""
+    import shutil
+    if not os.path.isdir(JOBS_DIR):
+        return
+    with JOBS_LOCK:
+        active_ids = {jid for jid, j in JOBS.items()
+                      if j.phase not in ("done", "error")}
+        # Also forget terminal jobs from the in-memory dict so /job/<id>/...
+        # doesn't keep returning stale data after we wipe the dir.
+        for jid in list(JOBS.keys()):
+            if jid not in active_ids:
+                JOBS.pop(jid, None)
+    removed = 0
+    try:
+        for entry in os.listdir(JOBS_DIR):
+            if entry.startswith("."):       # preserve .trt_cache and friends
+                continue
+            full = os.path.join(JOBS_DIR, entry)
+            if not os.path.isdir(full):
+                continue
+            if entry in active_ids:          # preserve in-flight jobs
+                continue
+            shutil.rmtree(full, ignore_errors=True)
+            removed += 1
+    except Exception as e:
+        print(f"[webapp] cleanup warning: {e}", flush=True)
+    if removed:
+        print(f"[webapp] cleaned up {removed} finished job dir(s) before new upload", flush=True)
 
 INDEX_HTML = r"""<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><title>Faceswap · live stream</title>
@@ -1362,6 +1402,11 @@ def index():
 
 @app.route("/start", methods=["POST"])
 def start():
+    # Wipe every previous (finished) job dir before this upload so old
+    # HLS segments + swapped.mp4s don't pile up on disk. The TRT engine
+    # cache is preserved.
+    _cleanup_finished_jobs()
+
     # `source` is multi-valued: user can upload 1+ face images. The first one
     # is the primary (back-compat) but every uploaded source gets matched
     # against its own video-side reference, so duets can swap both leads.
