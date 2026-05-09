@@ -16,6 +16,13 @@ env/
 .DS_Store
 Thumbs.db
 
+# --- Debug / scratch artefacts dropped at the repo root
+live-frame.png
+page-*.png
+debug-*.png
+*.commit-msg.tmp
+.commit-msg.tmp
+
 # --- Cloned upstream repos (provisioned by setup.ps1)
 facefusion/
 deep-live-cam/
