@@ -41,6 +41,20 @@ source/
 songs/
 out/
 webapp_jobs/
+server/jobs/
+server/static/dist/
+
+# --- Next.js / Node build outputs
+web/node_modules/
+web/.next/
+web/out/
+web/next-env.d.ts
+*.tsbuildinfo
+
+# --- Playwright debug screenshots dropped at the repo root
+new-upload-page.png
+latest_swapped_frame.png
+latest_swapped_frame.jpg
 
 # --- Logs
 *.log
