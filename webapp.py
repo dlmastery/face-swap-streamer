@@ -128,11 +128,20 @@ def _ensure_models():
     with _models_lock:
         if _face_analyser is None:
             face_model = os.getenv("FACESWAP_FACE_MODEL", "buffalo_l")
-            det_size = int(os.getenv("FACESWAP_DET_SIZE", "480"))
-            print(f"[webapp] loading face analyser (CUDA, model={face_model}, det_size={det_size})...", flush=True)
+            # det_size 640 is the model's native — preserves more detail for
+            # small/far faces. Detection costs a bit more than 480 but the
+            # quality win is worth it. det_thresh 0.3 is more permissive than
+            # the InsightFace default 0.5; needed to catch profile shots,
+            # tiny dance-floor faces, and motion-blurred frames. False-positive
+            # detections are filtered by the reference-embedding match later
+            # so the looser threshold is safe for our pipeline.
+            det_size = int(os.getenv("FACESWAP_DET_SIZE", "640"))
+            det_thresh = float(os.getenv("FACESWAP_DET_THRESH", "0.3"))
+            print(f"[webapp] loading face analyser (CUDA, model={face_model}, "
+                  f"det_size={det_size}, det_thresh={det_thresh})...", flush=True)
             fa = FaceAnalysis(name=face_model,
                               providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
-            fa.prepare(ctx_id=0, det_size=(det_size, det_size), det_thresh=0.4)
+            fa.prepare(ctx_id=0, det_size=(det_size, det_size), det_thresh=det_thresh)
             _face_analyser = fa
 
         if _swapper is None:
@@ -299,10 +308,15 @@ def _run_job(job: Job):
         _set(job, phase="finding_reference",
              message=f"Scanning video for {' + '.join(sorted(genders_needed))} face{'s' if len(genders_needed) > 1 else ''} to swap onto…")
         step = max(1, int(fps * 2.0))
+        # Min face width to consider as a reference candidate. 25 px is small
+        # — an upscale-ratio of ~25-30x for the inswapper's 128 input — but
+        # accepting these means dance-shot / wide-shot leads are still
+        # cluster-able. The detector's own threshold filters obvious garbage.
+        min_ref_face_w = int(os.getenv("FACESWAP_MIN_REF_FACE_W", "25"))
         # all_candidates: list of (score, embedding, frame_idx, gender)
         all_candidates: list = []
         i = 0
-        max_samples = 80
+        max_samples = 120  # was 80 — more samples → better cluster centroid
         while i < total and len(all_candidates) < max_samples:
             if job.stop_flag.is_set():
                 raise RuntimeError("cancelled")
@@ -314,7 +328,7 @@ def _run_job(job: Job):
                 if face.sex not in genders_needed:
                     continue
                 w_face = face.bbox[2] - face.bbox[0]
-                if w_face < 50:
+                if w_face < min_ref_face_w:
                     continue
                 all_candidates.append((float(w_face * face.det_score),
                                        face.normed_embedding, i, face.sex))
@@ -363,7 +377,12 @@ def _run_job(job: Job):
         msg_genders = ", ".join(f"{s.gender}@frame{s.ref_frame}" for s in job.sources)
         _set(job, phase="streaming",
              message=f"Streaming swap ({len(job.sources)} source{'s' if len(job.sources) > 1 else ''}: {msg_genders}) — audio is included")
-        REFERENCE_THRESH = 0.22
+        # Cosine-similarity threshold for "this detected face matches this
+        # source's locked reference". Smaller faces have less precise
+        # embeddings, so 0.18 (down from 0.22) keeps far-away/blurry leads
+        # in the swap. Override via env var if you see false-positive swaps
+        # on extras — bump to 0.25 or 0.30 for stricter matching.
+        REFERENCE_THRESH = float(os.getenv("FACESWAP_REF_THRESH", "0.18"))
 
         # Pre-stack reference embeddings for fast per-frame matching against
         # all sources at once.
