@@ -1,0 +1,46 @@
+# --- Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# --- IDE / OS / agents
+.vscode/
+.idea/
+.claude/
+.DS_Store
+Thumbs.db
+
+# --- Cloned upstream repos (provisioned by setup.ps1)
+facefusion/
+deep-live-cam/
+
+# --- Model files (too big; downloaded by setup.ps1)
+*.onnx
+*.pth
+*.pt
+*.bin
+*.safetensors
+.insightface/
+
+# --- Privacy: never commit personal source faces, copyrighted target videos,
+#     or derivative outputs to a public repo.
+source/
+songs/
+out/
+webapp_jobs/
+
+# --- Logs
+*.log
+
+# --- Test artefacts
+_t.onnx
+_cuda_test.onnx
+
+# --- Misc
+*.tmp
+*.bak

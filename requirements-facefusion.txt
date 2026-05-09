@@ -1,0 +1,11 @@
+# Extra deps that the FaceFusion path (Path A: high-quality offline render) needs
+# beyond what FaceFusion's own install.py installs. Same purpose as the cuDNN
+# stack in requirements-webapp.txt.
+
+nvidia-cudnn-cu12
+nvidia-cublas-cu12
+nvidia-cuda-runtime-cu12
+nvidia-cuda-nvrtc-cu12
+nvidia-curand-cu12
+nvidia-cufft-cu12
+nvidia-nvjitlink-cu12
