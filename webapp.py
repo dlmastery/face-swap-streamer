@@ -14,6 +14,7 @@ import glob
 import time
 import uuid
 import threading
+import queue
 import subprocess
 from dataclasses import dataclass, field
 from typing import Optional
@@ -313,48 +314,81 @@ def _run_job(job: Job):
         _set(job, phase="streaming",
              message=f"Streaming swap (locked onto {gender} face from frame {job.ref_frame}) — audio is included")
         REFERENCE_THRESH = 0.22
+
+        # ---- Async writer thread ------------------------------------------------
+        # Frame bytes are pushed onto a bounded queue; one writer thread drains
+        # the queue into ffmpeg.stdin. Decouples the main loop's GPU work from
+        # the blocking pipe write. Queue size 8 caps memory at ~50 MB for 1080p.
+        WRITE_Q_DEPTH = 8
+        WRITE_END = object()
+        write_q: "queue.Queue[object]" = queue.Queue(maxsize=WRITE_Q_DEPTH)
+        broken = False
+
+        def _writer_loop():
+            nonlocal broken
+            while True:
+                item = write_q.get()
+                if item is WRITE_END:
+                    return
+                try:
+                    ffmpeg.stdin.write(item)
+                except (BrokenPipeError, OSError):
+                    broken = True
+                    # Keep draining so the main loop's put() doesn't deadlock.
+                    while True:
+                        x = write_q.get()
+                        if x is WRITE_END:
+                            return
+
+        t_writer = threading.Thread(target=_writer_loop, daemon=True,
+                                    name=f"job-{job.id}-writer")
+        t_writer.start()
+
         n = 0
         swap_count = 0
         t0 = time.time()
         last_log = t0
-        broken = False
-        while True:
-            if job.stop_flag.is_set():
-                raise RuntimeError("cancelled")
-            ok, frame = cap.read()
-            if not ok:
-                break
-            n += 1
-            tgt_faces = fa.get(frame)
-            picked = None
-            best_sim = -1.0
-            for f in tgt_faces:
-                s = float(np.dot(f.normed_embedding, ref_emb))
-                if s > best_sim:
-                    best_sim = s
-                    picked = f
-            if best_sim < REFERENCE_THRESH:
+        try:
+            while True:
+                if job.stop_flag.is_set():
+                    raise RuntimeError("cancelled")
+                if broken:
+                    break
+                ok, frame = cap.read()
+                if not ok:
+                    break
+                n += 1
+                tgt_faces = fa.get(frame)
                 picked = None
+                best_sim = -1.0
+                for f in tgt_faces:
+                    s = float(np.dot(f.normed_embedding, ref_emb))
+                    if s > best_sim:
+                        best_sim = s
+                        picked = f
+                if best_sim < REFERENCE_THRESH:
+                    picked = None
 
-            if picked is not None:
-                frame = sw.get(frame, picked, src_face, paste_back=True)
-                swap_count += 1
+                if picked is not None:
+                    frame = sw.get(frame, picked, src_face, paste_back=True)
+                    swap_count += 1
 
-            try:
-                ffmpeg.stdin.write(frame.tobytes())
-            except (BrokenPipeError, OSError):
-                broken = True
-                break
+                # Hand off to the writer thread (will block if the queue is full,
+                # which is fine — provides natural backpressure on the pipeline).
+                write_q.put(frame.tobytes())
 
-            now = time.time()
-            if now - last_log > 0.5:
-                elapsed = now - t0
-                job.current_frame = n
-                job.swap_count = swap_count
-                job.proc_fps = n / elapsed if elapsed else 0.0
-                last_log = now
-
-        cap.release()
+                now = time.time()
+                if now - last_log > 0.5:
+                    elapsed = now - t0
+                    job.current_frame = n
+                    job.swap_count = swap_count
+                    job.proc_fps = n / elapsed if elapsed else 0.0
+                    last_log = now
+        finally:
+            # Always signal the writer to drain and exit, even on exceptions.
+            write_q.put(WRITE_END)
+            t_writer.join(timeout=30)
+            cap.release()
         # close ffmpeg cleanly so it writes the HLS endlist + finalises MP4
         try:
             ffmpeg.stdin.close()
