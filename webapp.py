@@ -116,32 +116,17 @@ _swapper = None
 
 
 def _ensure_models():
-    """Lazy-load the face analyser + inswapper. Called once on server start
-    (background thread) and again at the top of every job (no-op if already
-    loaded).
+    """Lazy-load the face analyser + inswapper. CUDA / cuDNN only — TensorRT
+    is intentionally disabled in this build (we suspected TRT engine caching
+    was contributing to confusing "old generation" results, and CUDA is
+    plenty fast for this workload).
 
-    Provider strategy:
-      - face analyser: CUDA only (its models have dynamic shapes that TRT
-        can't compile efficiently; CUDA is fast enough at 640x640).
-      - inswapper: TensorRT if the `tensorrt` pip package is installed
-        (30-50%% faster on RTX cards), otherwise plain CUDA. We never list
-        TRT as a provider unless the lib is actually present — onnxruntime
-        silently falls back ALL the way to CPU if its first listed provider
-        fails to initialise, which is much worse than just using CUDA.
-      - After load, we verify the active provider is CUDA (or TRT). If it
-        somehow fell back to CPU, we raise so the failure is visible
-        instead of grinding through frames at 1 fps.
+    After load we verify CUDA actually loaded — ORT silently falls back to
+    CPU on EP init failures, which is much worse than just using CUDA.
     """
     global _face_analyser, _swapper
     with _models_lock:
         if _face_analyser is None:
-            # Default is buffalo_l — the smaller buffalo_s gave noticeable
-            # swap-quality regression on this workload (less accurate
-            # embeddings → more reference-match misses → flicker). The env
-            # var stays so it's a one-line opt-in for anyone GPU-bound.
-            #
-            # det_size 480 (vs the model's native 640) is a safe ~1.7x
-            # speedup on the detector with only a small drop on tiny faces.
             face_model = os.getenv("FACESWAP_FACE_MODEL", "buffalo_l")
             det_size = int(os.getenv("FACESWAP_DET_SIZE", "480"))
             print(f"[webapp] loading face analyser (CUDA, model={face_model}, det_size={det_size})...", flush=True)
@@ -151,40 +136,10 @@ def _ensure_models():
             _face_analyser = fa
 
         if _swapper is None:
-            # Detect TensorRT availability: the python package, the EP wheel,
-            # AND the actual nvinfer DLLs all need to be present.
-            trt_available = False
-            try:
-                import tensorrt  # noqa: F401
-                # If we can also locate the EP shared library, TRT is usable.
-                ort_providers = set(ort.get_available_providers()) if (ort := __import__("onnxruntime")) else set()
-                trt_available = "TensorrtExecutionProvider" in ort_providers
-            except ImportError:
-                trt_available = False
-
-            if trt_available:
-                trt_cache = os.path.join(JOBS_DIR, ".trt_cache")
-                os.makedirs(trt_cache, exist_ok=True)
-                providers = [
-                    ("TensorrtExecutionProvider", {
-                        "trt_engine_cache_enable": True,
-                        "trt_engine_cache_path": trt_cache,
-                        "trt_fp16_enable": True,
-                        "trt_max_workspace_size": 2 * 1024 * 1024 * 1024,
-                    }),
-                    "CUDAExecutionProvider",
-                    "CPUExecutionProvider",
-                ]
-                print("[webapp] loading inswapper (TensorRT + CUDA, ~60-90s engine build on first run)...", flush=True)
-            else:
-                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
-                print("[webapp] loading inswapper (CUDA — `pip install tensorrt-cu12` in dlc env for ~30-50%% extra speed)...", flush=True)
-
+            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+            print("[webapp] loading inswapper (CUDA only, no TensorRT)...", flush=True)
             _swapper = insightface.model_zoo.get_model(SWAPPER_PATH, providers=providers)
 
-            # Verify CUDA actually loaded — onnxruntime silently falls back
-            # to CPU on EP init failures (e.g. cuDNN missing). Catch this
-            # loudly: a job running on CPU is much worse than a startup error.
             try:
                 active = _swapper.session.get_providers()
             except AttributeError:
@@ -615,40 +570,44 @@ def _cleanup_old_jobs(keep_hours: float = 6.0) -> None:
 
 
 def _cleanup_finished_jobs() -> None:
-    """Wipe every previous job dir on disk EXCEPT:
-      - anything starting with '.' (the TRT engine cache lives here, ~265 MB
-        per architecture — it takes 60-90 s to rebuild so we keep it)
-      - any job currently still running (phase != done/error)
+    """Wipe EVERYTHING under webapp_jobs/ EXCEPT jobs currently in flight.
 
-    Called at the top of /start so each new upload begins from a clean slate
-    — no old HLS segments, no old swapped.mp4, no leftover source images."""
+    Includes the .trt_cache dir (we're not using TRT in this build) and any
+    other dotfile leftovers. Each upload starts from a fully clean slate —
+    no HLS segments, no swapped.mp4, no old source/target files, no engine
+    caches that might be reused across runs.
+
+    Called at the top of /start.
+    """
     import shutil
     if not os.path.isdir(JOBS_DIR):
         return
     with JOBS_LOCK:
         active_ids = {jid for jid, j in JOBS.items()
                       if j.phase not in ("done", "error")}
-        # Also forget terminal jobs from the in-memory dict so /job/<id>/...
-        # doesn't keep returning stale data after we wipe the dir.
+        # Forget terminal jobs from the in-memory dict so /job/<id>/...
+        # 404s correctly after the dir is wiped instead of returning stale data.
         for jid in list(JOBS.keys()):
             if jid not in active_ids:
                 JOBS.pop(jid, None)
     removed = 0
     try:
         for entry in os.listdir(JOBS_DIR):
-            if entry.startswith("."):       # preserve .trt_cache and friends
-                continue
             full = os.path.join(JOBS_DIR, entry)
-            if not os.path.isdir(full):
+            if entry in active_ids:          # only preserve in-flight jobs
                 continue
-            if entry in active_ids:          # preserve in-flight jobs
-                continue
-            shutil.rmtree(full, ignore_errors=True)
-            removed += 1
+            try:
+                if os.path.isdir(full):
+                    shutil.rmtree(full, ignore_errors=True)
+                else:
+                    os.remove(full)
+                removed += 1
+            except Exception:
+                pass
     except Exception as e:
         print(f"[webapp] cleanup warning: {e}", flush=True)
     if removed:
-        print(f"[webapp] cleaned up {removed} finished job dir(s) before new upload", flush=True)
+        print(f"[webapp] wiped {removed} stale entr{'y' if removed == 1 else 'ies'} from webapp_jobs/ before new upload", flush=True)
 
 INDEX_HTML = r"""<!doctype html><html lang="en"><head>
 <meta charset="utf-8"><title>Faceswap · live stream</title>
