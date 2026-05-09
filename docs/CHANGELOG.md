@@ -1,0 +1,239 @@
+# Changelog
+
+All notable changes to face-swap-streamer, with the commits that
+introduced them and the lessons each one taught.
+
+---
+
+## v0.7 — Real downloadable MP4
+
+**`40ba7a1` Fix: produce a real MP4 (mobile + VLC compatible), not a fragmented one**
+
+Downloaded MP4s before this commit were fragmented (`movflags=
++frag_keyframe+empty_moov+default_base_moof`). They played in the
+browser via MSE, but iOS Safari, Android, VLC, QuickTime, Windows
+Media Player all rejected them — phones reported "format not
+supported", desktop apps played audio only.
+
+Fix: drop MP4 from the streaming ffmpeg's tee output, then in the
+finalise phase remux the (already-validated) HLS .ts segments into a
+standard non-fragmented MP4 with `+faststart`:
+
+```
+ffmpeg -y -allowed_extensions ALL -i hls/playlist.m3u8 \
+       -c copy -bsf:a aac_adtstoasc -movflags +faststart \
+       swapped.mp4
+```
+
+`-c copy` = no re-encode, ~5 s for a 4-minute song. `aac_adtstoasc`
+bitstream filter required for AAC ADTS → MP4 raw frames.
+
+**Lesson:** fragmented MP4 is a streaming-protocol format, not a file
+format. If the file will be opened by anything except an MSE-based
+player, always remux to non-fragmented.
+
+---
+
+## v0.6 — Multi-face + 4-stage pipeline
+
+**`d4fc024` 4-stage pipeline (reader → detect → swap → writer) + Q=128**
+
+Splits face detection from the swap step into its own thread. Now
+detection of frame N+1 starts while the swap on frame N is still
+finalising — meaningful pipeline overlap (subject to ORT's GPU lock).
+On this workload the GPU was already not the bottleneck (avg ~18%
+util) so fps gain was minimal, but the layout sets us up for any
+future GPU-side optimisation.
+
+**`2a0e0dd` Multi-face swap: upload 1 or 2 source images**
+
+Bollywood duets work end-to-end. Form has two drop-zones (Face #1
+required, Face #2 optional). Backend treats them as a list:
+
+- New `SourceSpec` dataclass: `path`, `gender`, `age`, `src_face`,
+  `ref_emb`, `ref_frame`, `ref_votes`, `ref_pool`
+- `Job.sources` list of these; legacy fields mirror `sources[0]` for
+  status-JSON back-compat
+- `/start` accepts `request.files.getlist("source")`
+- Per-source greedy cluster assignment (each source claims the
+  largest unused cluster of its gender, so two same-gender sources
+  don't collide)
+- Per-frame: stack target embeddings, dot-product against stacked
+  reference embeddings, argmax per target → swap with that source
+
+---
+
+## v0.5 — Pipeline + det_size
+
+**`0a966ce` det_size 640 → 480 + Q_DEPTH 32 → 64**
+
+`buffalo_l`'s detector at 480 runs ~1.7× faster than 640 with a small
+accuracy drop. `FACESWAP_DET_SIZE` env var to override.
+
+Q_DEPTH 32 → 64 gives the reader several seconds of slack so the GPU
+isn't starved by ffmpeg's HLS segment flushes (every 2 s).
+
+`baseline → +35 % (writer) → +7 % (reader) → +8 % (det 480)` —
+cumulative +56 % throughput.
+
+**`660e7d1` Async reader thread + larger queues (Q=8 → 32)**
+
+Mirrors the writer thread from the previous commit. Main loop sees
+only `queue.get()` / `queue.put()` — no blocking I/O. Cleanup logic in
+`finally`: set stop_flag, drain read_q so reader's pending put doesn't
+deadlock, send END to writer, join both threads before
+`cap.release()`.
+
+Cv2 decode of a 640×480 h264 stream is fast (~2 ms/frame) so the win
+was small (+7 %). Larger on 1080p+ inputs.
+
+**`8735818` Async writer thread**
+
+The original main worker loop was blocking on every
+`ffmpeg.stdin.write()` — a few ms each frame, but accumulating to a
+30–40 % wait when the GPU could've been processing the next frame.
+
+Push frame bytes onto `queue.Queue(maxsize=8)`, drain in a single
+writer thread. +35 % throughput, GPU peaks rose from ~35 % to ~59 %.
+
+**Lesson:** before adding more threads, profile to see whether the
+*current* threads are blocked on I/O or on compute. The writer was
+the cheap win because pipe writes were where the loop stalled.
+
+---
+
+## v0.4 — TRT enabled, no silent CPU fallback
+
+**`e36b4db` Enable real GPU usage: detect TRT before listing it, fall back to CUDA (not CPU)**
+
+The previous TRT-aware loader had a silent CPU-fallback bug: when
+`tensorrt` wasn't installed, ORT fell back ALL THE WAY to CPU instead
+of trying CUDA. Symptom: GPU at 0 %, CPU at 70 %+, inswapper grinding
+through frames at 1–2 fps.
+
+Fix:
+
+1. Detect TRT availability *before* listing it as a provider:
+   `import tensorrt` AND `"TensorrtExecutionProvider" in
+   ort.get_available_providers()`. Otherwise hand ORT a CUDA-only
+   list.
+2. After load, assert `_swapper.session.get_providers() !=
+   ['CPUExecutionProvider']` — better to crash startup than to grind
+   on CPU for 4 minutes per song.
+3. DLL search path includes `tensorrt_libs/` (TRT's pip package puts
+   DLLs there, not under `nvidia/<lib>/bin/`).
+
+`requirements-webapp.txt` adds `tensorrt-cu12>=10.0` (~2 GB,
+optional).
+
+**Lesson:** ORT's "fall back to next provider" is fall-back-to-CPU,
+not fall-back-to-the-next-listed. Detect each provider's prerequisites
+before naming it.
+
+---
+
+## v0.3 — Reliable autoplay + UI polish
+
+**`6ce108b` Reliable autoplay + TensorRT inswapper + CLAUDE.md operator manual**
+
+Autoplay reliability:
+
+- `<video muted autoplay>` HTML attributes — declarative path is
+  more permissive than calling `play()` from JS
+- `tryStartPlayback()` only sets `playStarted=true` *after* `play()`
+  resolves, retries every 1s on rejection
+- Universal click-anywhere rescue: any click on the page also
+  triggers play()
+- "Click to unmute" overlay shrunk from full-page blur to a small
+  pulsing pill (the full overlay made the playing video look blank)
+
+TensorRT inswapper with FP16 + engine caching at
+`webapp_jobs/.trt_cache/`. ~30–50 % uplift on RTX cards. First job
+pays a ~60–90 s engine build; cached for all subsequent jobs.
+
+CLAUDE.md (initial 750-line operator manual): prereqs, first-run,
+code map, HTTP API, the five Windows-specific bugs we hit and fixed,
+troubleshooting matrix, perf numbers, security, smoke-test
+checklist.
+
+**Lesson:** browser autoplay policy is the trickiest cross-browser
+issue in the codebase. Always set `muted=true` *before* `play()`,
+always retry on rejection, always offer a click-rescue.
+
+---
+
+## v0.2 — HLS streaming with audio
+
+**`36a6310` Fix HLS streaming: ffmpeg tee path, pre-buffer, autoplay unmute overlay**
+
+Three bugs:
+
+1. ffmpeg tee muxer URL parser treats `:` as an option separator, so
+   Windows absolute paths (`C:/Users/...`) silently broke output. Run
+   ffmpeg with `cwd=<job_dir>` and use relative paths inside the tee
+   URL. Also drain ffmpeg's stderr to `<job_dir>/ffmpeg.log` on a
+   background thread so future failures aren't silent.
+
+2. Browsers block autoplay-with-audio until user interacts. Video was
+   decoded and ready (`readyState=4, 1920x1080`) but stuck on
+   `play()` reject. Start the player muted so autoplay succeeds, then
+   surface a "Click to unmute" overlay button.
+
+3. Swap pipeline runs slower than realtime (~7 fps wall-clock vs 25
+   fps source) → the live edge moved faster than the buffer could
+   refill, causing constant 1-second stutters. Pre-buffer 15 seconds
+   before starting playback, and on `waiting` events wait until the
+   buffer recovers to 8 seconds before resuming.
+
+**Lesson:** Windows path quirks bite once per project. Always
+test ffmpeg invocations with absolute Windows paths, OR use cwd +
+relative paths.
+
+---
+
+## v0.1 — Initial release
+
+**`f115d94` Initial commit: live face-swap web app with HLS audio streaming**
+
+The first working version:
+
+- Flask app with drag-drop upload, auto gender detect,
+  embedding-locked reference matching, HLS+MP4 tee-muxer streaming
+  so the browser hears the song audio while the swap is still
+  processing
+- `stream-swap.py`: CLI version that streams to ffplay or saves an
+  audio-muxed MP4
+- `swap-song.ps1` / `swap-album.ps1`: PowerShell wrappers around
+  FaceFusion 3.6 headless-run for highest-quality offline renders
+- `play-song.ps1`: launcher for Deep-Live-Cam GUI (path B —
+  real-time playback)
+- `setup.ps1`: one-shot installer (conda envs, upstream clones,
+  model downloads, cuDNN DLL-search patches for FaceFusion conda.py
+  and DLC run.py)
+- `README.md`, `DESIGN.md`, `OBS-setup.md`: docs covering
+  architecture, the cuDNN `os.add_dll_directory` issue, why two
+  conda envs, the HLS pipeline, and the embedding-clustering
+  reference-extraction algorithm
+
+---
+
+## Lessons summary (highest-impact first)
+
+1. **Don't trust ORT's "next provider" fallback.** It's fall-back-
+   to-CPU, not fall-back-to-the-next-named-provider. Detect each
+   provider's prereqs before listing it.
+2. **Fragmented MP4 isn't a file format.** Always remux to standard
+   non-fragmented MP4 for downloads.
+3. **Windows + native deps + Python = DLL search hell.** Always
+   `os.add_dll_directory` and store the cookies. Always test the
+   built env on a clean Windows shell.
+4. **ffmpeg tee URLs and Windows drive letters don't mix.** Use cwd
+   + relative paths inside the tee URL.
+5. **Browser autoplay policy is asymmetric — `muted` must be set
+   before `play()`, and you must retry on rejection.** Always.
+6. **Don't combine three speedup changes in one commit.** When one
+   breaks, you don't know which. (We learned this with a `list index
+   out of range` bug at frame 295.)
+7. **Profile before adding threads.** The cheap thread (writer) won
+   us 35 %; the second thread (reader) won 7 %; the third (detector)
+   won effectively 0 % because GPU wasn't the bottleneck any more.

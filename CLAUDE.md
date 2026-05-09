@@ -9,6 +9,19 @@ without breaking it**.
 If you only have time for one thing, read the [TL;DR](#tldr-getting-it-running),
 then [Things that broke before](#things-that-broke-before--dont-re-break-them).
 
+For deeper reading once you're past the basics:
+
+- [README.md](README.md) — user-facing overview, quickstart
+- [USERGUIDE.md](USERGUIDE.md) — end-user walkthrough, FAQ
+- [DESIGN.md](DESIGN.md) — *why* the architecture is shaped this way
+- [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — the *how*: dataflow, threading, HTTP API, file layout
+- [docs/PERFORMANCE.md](docs/PERFORMANCE.md) — perf tuning, per-stage timings, what's been tried
+- [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) — symptom → cause → fix table
+- [docs/CHANGELOG.md](docs/CHANGELOG.md) — every commit and what it taught us
+- [docs/HACKING.md](docs/HACKING.md) — onboarding for new developers
+- [docs/CONTRIBUTING.md](docs/CONTRIBUTING.md) — PR process, code of conduct
+- [OBS-setup.md](OBS-setup.md) — virtual webcam recipe
+
 ---
 
 ## Table of contents
@@ -537,6 +550,40 @@ The `_run_job` finally block:
    then `t_reader.join(timeout=10)` — must be in this order so that
    any frames in flight reach ffmpeg before we close cap
 5. `cap.release()`
+
+### 13.5 Fragmented MP4 isn't a real MP4
+
+We originally output the downloadable MP4 via the same ffmpeg tee
+that produced HLS, with `movflags=+frag_keyframe+empty_moov+
+default_base_moof`. That works for browser MSE players (the inline
+`<video>` we use for the in-page VOD fallback) but **fails on every
+native player**: phones reported "format not supported", desktop
+apps played audio only because video fragments were unreadable,
+ffprobe couldn't even parse the file.
+
+Fix: drop MP4 from the streaming ffmpeg's tee output. Stream HLS only
+during processing. Then in the finalise phase, run a second ffmpeg
+pass that remuxes (no re-encode) the .ts segments into a real MP4
+with `+faststart`:
+
+```python
+def _remux_to_mp4(job: Job) -> None:
+    cmd = [FFMPEG_EXE, "-y", "-allowed_extensions", "ALL",
+           "-i", os.path.join(job.hls_dir, "playlist.m3u8"),
+           "-c", "copy", "-bsf:a", "aac_adtstoasc",
+           "-movflags", "+faststart",
+           job.out_audio_path]
+    rc = subprocess.call(cmd)
+    if rc != 0: raise RuntimeError(f"remux failed (rc={rc})")
+```
+
+`-bsf:a aac_adtstoasc` is required because TS segments carry AAC in
+ADTS framing while MP4 needs raw AAC frames. `+faststart` puts the
+moov atom at the front so iOS Safari and progressive download work.
+
+Lesson: fragmented MP4 is a streaming protocol format. Always remux
+to non-fragmented MP4 if the file will be opened by anything except
+an MSE-based player.
 
 ### 13. Multi-source matching
 
