@@ -206,14 +206,45 @@ def _set(job: Job, **kw):
         setattr(job, k, v)
 
 
+def _remux_to_mp4(job: Job) -> None:
+    """Concat the finalised HLS .ts segments into a standard MP4 with the
+    `moov` atom moved to the front (`+faststart`). The result plays on every
+    mainstream player — iOS Safari, Android, VLC, Windows MP, Quicktime."""
+    if not FFMPEG_EXE:
+        raise RuntimeError("ffmpeg not found")
+    playlist = os.path.join(job.hls_dir, "playlist.m3u8")
+    if not os.path.isfile(playlist):
+        raise RuntimeError(f"HLS playlist missing: {playlist}")
+    cmd = [
+        FFMPEG_EXE, "-y", "-hide_banner", "-loglevel", "warning",
+        "-allowed_extensions", "ALL",
+        "-i", playlist,
+        "-c", "copy",
+        "-bsf:a", "aac_adtstoasc",      # required when concat-muxing AAC ADTS into MP4
+        "-movflags", "+faststart",       # moov at start so mobile/QuickTime can stream
+        job.out_audio_path,
+    ]
+    print(f"[webapp] remuxing HLS -> MP4 (+faststart): {job.out_audio_path}", flush=True)
+    rc = subprocess.call(cmd)
+    if rc != 0:
+        raise RuntimeError(f"HLS -> MP4 remux failed (rc={rc})")
+
+
 def _spawn_ffmpeg(job: Job, w: int, h: int, fps: float) -> subprocess.Popen:
     """Spawn ffmpeg: BGR frames on stdin + audio from target.mp4, h264+aac out,
-    tee muxer writes both live HLS and a fragmented MP4. Audio is muxed in DURING
-    streaming so the browser hears it live.
+    written to HLS (.m3u8 + .ts segments) only. The downloadable MP4 is built in
+    a separate finalise step (`_remux_to_mp4`) by concatenating the HLS .ts
+    segments — this gives us a standard non-fragmented MP4 with +faststart that
+    plays on iOS Safari, Android, VLC, and Windows Media Player.
 
-    NB: we run ffmpeg with cwd=<job_dir> so paths inside the tee URL are relative.
-    Windows drive-letter colons (C:/...) collide with tee's `:` option separator,
-    so absolute paths break it silently — relative paths sidestep that entirely.
+    Why not fragmented MP4 in tee any more: with empty_moov+frag_keyframe many
+    native players (especially mobile) can't open the file at all — symptoms
+    were "format not supported" on phones and "audio only" on desktop because
+    only the audio fragments were decodable.
+
+    NB: we run ffmpeg with cwd=<job_dir> so paths inside the HLS args are
+    relative. Windows drive-letter colons (C:/...) collide with hls option
+    separators, so absolute paths break it silently — relative sidesteps that.
     """
     if not FFMPEG_EXE:
         raise RuntimeError("ffmpeg not found — install Gyan.FFmpeg or anaconda's ffmpeg")
@@ -221,21 +252,9 @@ def _spawn_ffmpeg(job: Job, w: int, h: int, fps: float) -> subprocess.Popen:
     job_dir = os.path.dirname(job.out_audio_path)
     target_abs = os.path.abspath(job.target_path)
 
-    # All paths in the tee URL are relative to job_dir.
+    # HLS-only output (relative paths since cwd=job_dir).
     playlist = "hls/playlist.m3u8"
     seg_pattern = "hls/seg_%05d.ts"
-    final_mp4 = os.path.basename(job.out_audio_path)
-
-    # Tee muxer: one encode pass, two outputs (live HLS + downloadable MP4).
-    # MP4 uses fragmented format (frag_keyframe+empty_moov) so it can be written
-    # progressively without seeking back to the moov atom.
-    tee = (
-        f"[f=hls:hls_time=2:hls_list_size=0:"
-        f"hls_flags=independent_segments+append_list:"
-        f"hls_segment_filename={seg_pattern}]{playlist}"
-        f"|"
-        f"[f=mp4:movflags=+frag_keyframe+empty_moov+default_base_moof]{final_mp4}"
-    )
 
     cmd = [
         FFMPEG_EXE, "-y", "-hide_banner", "-loglevel", "info",
@@ -254,9 +273,16 @@ def _spawn_ffmpeg(job: Job, w: int, h: int, fps: float) -> subprocess.Popen:
         "-sc_threshold", "0",
         "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
         "-shortest",
-        "-f", "tee", tee,
+        # HLS output (only). MP4 is produced post-streaming by remuxing the
+        # .ts segments — see _remux_to_mp4 below.
+        "-f", "hls",
+        "-hls_time", "2",
+        "-hls_list_size", "0",
+        "-hls_flags", "independent_segments+append_list",
+        "-hls_segment_filename", seg_pattern,
+        playlist,
     ]
-    print(f"[webapp] ffmpeg cwd={job_dir} cmd={' '.join(cmd[:8])}... tee(hls,mp4)", flush=True)
+    print(f"[webapp] ffmpeg cwd={job_dir} cmd={' '.join(cmd[:8])}... hls only", flush=True)
     # Capture stderr so we can surface real errors. Drain it on a background thread
     # to avoid the OS pipe filling up and stalling ffmpeg.
     proc = subprocess.Popen(cmd, stdin=subprocess.PIPE,
@@ -518,7 +544,7 @@ def _run_job(job: Job):
             ffmpeg.stdin.close()
         except Exception:
             pass
-        _set(job, phase="finalising", message="Finalising MP4 + HLS playlist…")
+        _set(job, phase="finalising", message="Finalising HLS playlist…")
         try:
             ffmpeg.wait(timeout=60)
         except subprocess.TimeoutExpired:
@@ -534,6 +560,15 @@ def _run_job(job: Job):
             except Exception:
                 pass
             raise RuntimeError(f"ffmpeg failed (rc={ffmpeg.returncode}): {err[-800:]}")
+
+        # Build a standard +faststart MP4 from the HLS segments for download.
+        _set(job, phase="finalising",
+             message="Building downloadable MP4 (+faststart) from HLS segments…")
+        try:
+            _remux_to_mp4(job)
+        except Exception as e:
+            print(f"[webapp] remux warning: {e}", flush=True)
+            # Don't fail the whole job — HLS playback still works.
 
         _set(job, phase="done", message="Done — audio + video saved", finished=time.time(),
              current_frame=n, swap_count=swap_count,
