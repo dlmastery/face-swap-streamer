@@ -14,6 +14,16 @@ const nextConfig: NextConfig = {
   trailingSlash: true,
   images: { unoptimized: true },
 
+  // Explicit upload limit. Default Next.js dev proxy caps middleware request
+  // bodies at 10 MB which silently breaks any real video upload. Set to 8 GB
+  // to comfortably accommodate ≥ 1 GB videos plus headroom.
+  middlewareClientMaxBodySize: 8 * 1024 * 1024 * 1024,
+  experimental: {
+    serverActions: {
+      bodySizeLimit: "8gb",
+    },
+  },
+
   async rewrites() {
     return [
       { source: "/api/:path*", destination: `${FASTAPI_URL}/api/:path*` },

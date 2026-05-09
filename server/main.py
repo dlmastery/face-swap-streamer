@@ -78,8 +78,10 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Upload size cap is enforced via a custom middleware below.
-MAX_UPLOAD = 8 * 1024 * 1024 * 1024  # 8 GB total per request
+# Upload size cap. 8 GB total per request — comfortably accommodates 1 GB
+# videos × N for batch uploads plus headroom. Set MAX_UPLOAD_GB env var to
+# tune (e.g. 16 for 16 GB).
+MAX_UPLOAD = int(os.getenv("MAX_UPLOAD_GB", "8")) * 1024 * 1024 * 1024
 
 
 @app.middleware("http")
@@ -87,7 +89,12 @@ async def limit_upload_size(request: Request, call_next):
     if request.method == "POST":
         cl = request.headers.get("content-length")
         if cl and cl.isdigit() and int(cl) > MAX_UPLOAD:
-            return JSONResponse({"error": "upload too large"}, status_code=413)
+            return JSONResponse(
+                {"error": "upload too large",
+                 "max_bytes": MAX_UPLOAD,
+                 "max_human": f"{MAX_UPLOAD // (1024 ** 3)} GB"},
+                status_code=413,
+            )
     return await call_next(request)
 
 

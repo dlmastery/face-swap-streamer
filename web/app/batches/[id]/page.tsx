@@ -31,6 +31,8 @@ export default function BatchViewer({ params }: { params: Promise<{ id: string }
 
   const isDone = s?.phase === "done";
   const hasErrors = (s?.error_videos ?? 0) > 0;
+  const readyCount = s?.done_videos ?? 0;
+  const canDownloadAny = readyCount > 0;
 
   return (
     <main className="mx-auto w-full max-w-6xl px-6 py-8 pb-24">
@@ -61,18 +63,23 @@ export default function BatchViewer({ params }: { params: Promise<{ id: string }
           </div>
         )}
 
-        {isDone && (
+        {canDownloadAny && (
           <a
             href={batchDownloadZipUrl(id)}
             download
             className="mt-5 inline-flex w-fit items-center gap-2 rounded-xl bg-gradient-to-br from-(--color-accent-1) to-(--color-accent-2) px-5 py-3 text-sm font-semibold text-white shadow-[0_12px_30px_rgba(122,92,255,0.35)] transition hover:-translate-y-0.5"
+            title={isDone
+              ? `Download all ${readyCount} swapped MP4s as a single zip`
+              : `Download the ${readyCount} ready so far as a zip (rest will appear as they finish)`}
           >
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.2" strokeLinecap="round" strokeLinejoin="round">
               <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4" />
               <polyline points="7 10 12 15 17 10" />
               <line x1="12" y1="15" x2="12" y2="3" />
             </svg>
-            Download all as zip
+            {isDone
+              ? `Download all ${readyCount} as zip`
+              : `Download ready ${readyCount} of ${s?.total_videos ?? 0} as zip`}
           </a>
         )}
         {hasErrors && (

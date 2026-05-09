@@ -87,7 +87,15 @@ export interface BatchCreated {
   jobs: string[];
 }
 
-const apiBase = "";
+/** Base URL for the FastAPI backend. In dev, point straight at :8081 so
+ * we bypass the Next.js dev proxy (which has a 10 MB body limit and chokes
+ * on real video uploads). In production, the Next.js static build is
+ * served from FastAPI's `/`, so empty string == same origin works. */
+const apiBase =
+  (typeof process !== "undefined" && process.env.NEXT_PUBLIC_API_URL)
+  || (typeof window !== "undefined" && window.location.port === "3000"
+      ? `${window.location.protocol}//${window.location.hostname}:8081`
+      : "");
 
 export async function uploadSingle(
   sources: File[],
@@ -146,9 +154,12 @@ export function subscribeBatch(
 function _subscribe<T>(path: string, onMessage: (m: T) => void, onError?: (e: Event) => void) {
   let closedByUs = false;
   let ws: WebSocket | null = null;
-  const wsUrl =
-    (typeof window !== "undefined" ? window.location.origin : "")
-      .replace(/^http/, "ws") + path;
+  // Use the same apiBase so the WebSocket connects directly to FastAPI
+  // (no Next.js proxy, which doesn't forward WebSocket upgrade properly).
+  const wsBase =
+    apiBase ||
+    (typeof window !== "undefined" ? window.location.origin : "");
+  const wsUrl = wsBase.replace(/^http/, "ws") + path;
 
   const open = () => {
     ws = new WebSocket(wsUrl);

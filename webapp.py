@@ -558,13 +558,14 @@ def _run_job(job: Job):
 # ---- Flask app -------------------------------------------------------------
 
 app = Flask(__name__, static_folder=None)
-app.config["MAX_CONTENT_LENGTH"] = 4 * 1024 * 1024 * 1024  # 4 GB upload limit
-app.config["MAX_FORM_MEMORY_SIZE"] = 4 * 1024 * 1024 * 1024
+_MAX_GB = int(os.getenv("MAX_UPLOAD_GB", "8"))
+app.config["MAX_CONTENT_LENGTH"] = _MAX_GB * 1024 * 1024 * 1024
+app.config["MAX_FORM_MEMORY_SIZE"] = _MAX_GB * 1024 * 1024 * 1024
 
 
 @app.errorhandler(413)
 def too_large(_):
-    return "File too large (4 GB limit)", 413
+    return f"File too large ({_MAX_GB} GB limit; set MAX_UPLOAD_GB env var to raise)", 413
 
 
 def _cleanup_old_jobs(keep_hours: float = 6.0) -> None:
