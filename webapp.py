@@ -385,20 +385,22 @@ def _run_job(job: Job):
         ref_embs = np.stack([s.ref_emb for s in job.sources])  # shape (S, D)
         ref_sources = list(job.sources)                        # parallel index
 
-        # ---- Async reader + writer threads --------------------------------------
-        # Reader: cv2.read() into read_q so the main loop never blocks on decode.
-        # Writer: drains write_q into ffmpeg.stdin so the main loop never blocks
-        # on the pipe. Both queues are bounded → memory is capped, full queues
-        # provide natural backpressure.
-        # Q_DEPTH=64 → ~800 MB at 1080p (each queue holds raw BGR), plenty of
-        # slack for momentary read/write stalls (e.g. ffmpeg flushing a HLS
-        # segment every 2 s) while still bounded. With this much buffer the
-        # reader can run several seconds ahead of the swap loop, so the GPU
-        # is never starved by I/O hiccups.
-        Q_DEPTH = 64
+        # ---- 4-stage pipeline: reader -> detector -> swapper -> writer --------
+        # Each stage runs in its own thread, hand-off via bounded queues. This
+        # lets detection of frame N+1 overlap with the swap of frame N (GPU is
+        # serialised by ORT but CPU-side prep + paste_back can overlap), and
+        # lets cv2 decode + ffmpeg pipe writes happen entirely off the GPU
+        # critical path.
+        #
+        # Q_DEPTH=128 → ~1.6 GB at 1080p across all three queues. With this
+        # much slack the reader runs ~5-10 sec ahead of the swap loop, so
+        # transient I/O hiccups (ffmpeg flushing an HLS segment, page-cache
+        # writes) never starve the GPU.
+        Q_DEPTH = 128
         END = object()
-        read_q: "queue.Queue[object]" = queue.Queue(maxsize=Q_DEPTH)
-        write_q: "queue.Queue[object]" = queue.Queue(maxsize=Q_DEPTH)
+        read_q: "queue.Queue[object]"   = queue.Queue(maxsize=Q_DEPTH)
+        detect_q: "queue.Queue[object]" = queue.Queue(maxsize=Q_DEPTH)
+        write_q: "queue.Queue[object]"  = queue.Queue(maxsize=Q_DEPTH)
         broken = False
 
         def _reader_loop():
@@ -410,6 +412,28 @@ def _run_job(job: Job):
                     read_q.put(fr)
             finally:
                 read_q.put(END)
+
+        def _detect_loop():
+            """Detect faces + embedding-match against the source pool. Emits
+            (frame, list_of_(face, source_index)) tuples to the swap stage."""
+            try:
+                while True:
+                    item = read_q.get()
+                    if item is END:
+                        return
+                    frame = item
+                    tgt_faces = fa.get(frame)
+                    picks = []
+                    if tgt_faces:
+                        tgt_embs = np.stack([f.normed_embedding for f in tgt_faces])
+                        sims = tgt_embs @ ref_embs.T          # (T, S)
+                        for ti, tface in enumerate(tgt_faces):
+                            si = int(np.argmax(sims[ti]))
+                            if float(sims[ti, si]) >= REFERENCE_THRESH:
+                                picks.append((tface, si))
+                    detect_q.put((frame, picks))
+            finally:
+                detect_q.put(END)
 
         def _writer_loop():
             nonlocal broken
@@ -428,9 +452,12 @@ def _run_job(job: Job):
 
         t_reader = threading.Thread(target=_reader_loop, daemon=True,
                                     name=f"job-{job.id}-reader")
+        t_detect = threading.Thread(target=_detect_loop, daemon=True,
+                                    name=f"job-{job.id}-detect")
         t_writer = threading.Thread(target=_writer_loop, daemon=True,
                                     name=f"job-{job.id}-writer")
         t_reader.start()
+        t_detect.start()
         t_writer.start()
 
         n = 0
@@ -443,31 +470,16 @@ def _run_job(job: Job):
                     raise RuntimeError("cancelled")
                 if broken:
                     break
-                item = read_q.get()
+                item = detect_q.get()
                 if item is END:
                     break
-                frame = item
+                frame, picks = item
                 n += 1
-                tgt_faces = fa.get(frame)
-                # For each detected face, pick the best-matching source (if
-                # any clear it the threshold). A face that doesn't clearly
-                # belong to any uploaded source passes through untouched.
-                # Greedy assignment: each source can swap multiple faces in a
-                # frame (e.g. crowd shots), each face matches its single best
-                # source.
-                if tgt_faces:
-                    tgt_embs = np.stack([f.normed_embedding for f in tgt_faces])  # (T, D)
-                    sims = tgt_embs @ ref_embs.T                                    # (T, S)
-                    for ti, tface in enumerate(tgt_faces):
-                        si = int(np.argmax(sims[ti]))
-                        if float(sims[ti, si]) < REFERENCE_THRESH:
-                            continue
-                        frame = sw.get(frame, tface, ref_sources[si].src_face,
-                                       paste_back=True)
-                        swap_count += 1
+                for tface, si in picks:
+                    frame = sw.get(frame, tface, ref_sources[si].src_face,
+                                   paste_back=True)
+                    swap_count += 1
 
-                # Hand off to the writer thread (will block if the queue is full,
-                # which is fine — provides natural backpressure on the pipeline).
                 if broken:
                     break
                 write_q.put(frame.tobytes())
@@ -480,19 +492,21 @@ def _run_job(job: Job):
                     job.proc_fps = n / elapsed if elapsed else 0.0
                     last_log = now
         finally:
-            # Tell the writer to drain and exit, even on exceptions. The reader
-            # exits on its own when cap.read() returns False; if we're bailing
-            # early, set the stop_flag so it stops promptly on its next iter.
+            # Tell the reader to stop on its next iteration. The reader puts
+            # END into read_q on exit; the detector then forwards END into
+            # detect_q; the main loop sees END and breaks. We additionally
+            # drain any pending items so blocked put()s don't deadlock the
+            # join. Writer gets its own END from us here.
             job.stop_flag.set()
-            # Drain any remaining items the reader might have queued so its
-            # final put(END) doesn't block on a full queue and hang join().
-            try:
-                while True:
-                    read_q.get_nowait()
-            except queue.Empty:
-                pass
+            for q_ in (read_q, detect_q):
+                try:
+                    while True:
+                        q_.get_nowait()
+                except queue.Empty:
+                    pass
             write_q.put(END)
             t_writer.join(timeout=30)
+            t_detect.join(timeout=10)
             t_reader.join(timeout=10)
             cap.release()
         # close ffmpeg cleanly so it writes the HLS endlist + finalises MP4
