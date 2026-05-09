@@ -18,13 +18,21 @@ import subprocess
 from dataclasses import dataclass, field
 from typing import Optional
 
-# ---- Win Py 3.8+ secure DLL search: register CUDA dirs before onnxruntime import
+# ---- Win Py 3.8+ secure DLL search: register CUDA + TensorRT dirs before
+#      onnxruntime import. PATH alone is NOT enough on Py 3.8+ Windows;
+#      os.add_dll_directory cookies must be kept alive (don't GC them).
 _dll_cookies = []
 if sys.platform == "win32":
     _sp = os.path.join(sys.prefix, "Lib", "site-packages")
-    for _sub in ("cudnn", "cublas", "cuda_runtime", "curand", "cufft",
-                 "cuda_nvrtc", "nvjitlink"):
-        _bin = os.path.join(_sp, "nvidia", _sub, "bin")
+    _bin_dirs = [
+        # nvidia-cudnn-cu12, nvidia-cublas-cu12, etc.
+        *(os.path.join(_sp, "nvidia", sub, "bin")
+          for sub in ("cudnn", "cublas", "cuda_runtime", "curand", "cufft",
+                      "cuda_nvrtc", "nvjitlink")),
+        # tensorrt-cu12 puts its DLLs at site-packages/tensorrt_libs/ (different layout)
+        os.path.join(_sp, "tensorrt_libs"),
+    ]
+    for _bin in _bin_dirs:
         if os.path.isdir(_bin):
             try:
                 _dll_cookies.append(os.add_dll_directory(_bin))
@@ -93,43 +101,76 @@ _swapper = None
 def _ensure_models():
     """Lazy-load the face analyser + inswapper. Called once on server start
     (background thread) and again at the top of every job (no-op if already
-    loaded). The inswapper tries TensorRT first (30-50%% faster on RTX cards),
-    falling back to plain CUDA if the TRT engine build fails."""
+    loaded).
+
+    Provider strategy:
+      - face analyser: CUDA only (its models have dynamic shapes that TRT
+        can't compile efficiently; CUDA is fast enough at 640x640).
+      - inswapper: TensorRT if the `tensorrt` pip package is installed
+        (30-50%% faster on RTX cards), otherwise plain CUDA. We never list
+        TRT as a provider unless the lib is actually present — onnxruntime
+        silently falls back ALL the way to CPU if its first listed provider
+        fails to initialise, which is much worse than just using CUDA.
+      - After load, we verify the active provider is CUDA (or TRT). If it
+        somehow fell back to CPU, we raise so the failure is visible
+        instead of grinding through frames at 1 fps.
+    """
     global _face_analyser, _swapper
     with _models_lock:
         if _face_analyser is None:
-            print("[webapp] loading face analyser...", flush=True)
-            # Face analyser uses several models with dynamic shapes (det_10g
-            # has '?' in its input). TensorRT struggles with those, so we
-            # keep CUDA here. CUDA execution is fast enough for 640x640.
+            print("[webapp] loading face analyser (CUDA)...", flush=True)
             fa = FaceAnalysis(name="buffalo_l",
                               providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
             fa.prepare(ctx_id=0, det_size=(640, 640), det_thresh=0.4)
             _face_analyser = fa
+
         if _swapper is None:
-            # inswapper has a static 1x3x128x128 input — perfect for TRT engine
-            # caching. First call after a clean install builds the engine
-            # (~60-90s); cached afterwards.
-            trt_cache = os.path.join(JOBS_DIR, ".trt_cache")
-            os.makedirs(trt_cache, exist_ok=True)
-            providers = [
-                ("TensorrtExecutionProvider", {
-                    "trt_engine_cache_enable": True,
-                    "trt_engine_cache_path": trt_cache,
-                    "trt_fp16_enable": True,
-                    "trt_max_workspace_size": 2 * 1024 * 1024 * 1024,  # 2GB
-                }),
-                "CUDAExecutionProvider",
-                "CPUExecutionProvider",
-            ]
+            # Detect TensorRT availability: the python package, the EP wheel,
+            # AND the actual nvinfer DLLs all need to be present.
+            trt_available = False
             try:
-                print("[webapp] loading inswapper (TensorRT, building engine on first run)...", flush=True)
-                _swapper = insightface.model_zoo.get_model(SWAPPER_PATH, providers=providers)
-            except Exception as e:
-                print(f"[webapp] TensorRT load failed ({e}), falling back to CUDA", flush=True)
-                _swapper = insightface.model_zoo.get_model(
-                    SWAPPER_PATH,
-                    providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+                import tensorrt  # noqa: F401
+                # If we can also locate the EP shared library, TRT is usable.
+                ort_providers = set(ort.get_available_providers()) if (ort := __import__("onnxruntime")) else set()
+                trt_available = "TensorrtExecutionProvider" in ort_providers
+            except ImportError:
+                trt_available = False
+
+            if trt_available:
+                trt_cache = os.path.join(JOBS_DIR, ".trt_cache")
+                os.makedirs(trt_cache, exist_ok=True)
+                providers = [
+                    ("TensorrtExecutionProvider", {
+                        "trt_engine_cache_enable": True,
+                        "trt_engine_cache_path": trt_cache,
+                        "trt_fp16_enable": True,
+                        "trt_max_workspace_size": 2 * 1024 * 1024 * 1024,
+                    }),
+                    "CUDAExecutionProvider",
+                    "CPUExecutionProvider",
+                ]
+                print("[webapp] loading inswapper (TensorRT + CUDA, ~60-90s engine build on first run)...", flush=True)
+            else:
+                providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
+                print("[webapp] loading inswapper (CUDA — `pip install tensorrt-cu12` in dlc env for ~30-50%% extra speed)...", flush=True)
+
+            _swapper = insightface.model_zoo.get_model(SWAPPER_PATH, providers=providers)
+
+            # Verify CUDA actually loaded — onnxruntime silently falls back
+            # to CPU on EP init failures (e.g. cuDNN missing). Catch this
+            # loudly: a job running on CPU is much worse than a startup error.
+            try:
+                active = _swapper.session.get_providers()
+            except AttributeError:
+                active = None
+            print(f"[webapp] inswapper active providers: {active}", flush=True)
+            if active and active == ["CPUExecutionProvider"]:
+                raise RuntimeError(
+                    "inswapper loaded on CPU only — CUDA failed to initialise. "
+                    "Run `conda run -n dlc python test-cuda-dlc.py` to diagnose; "
+                    "usually means cuDNN/cuBLAS DLLs aren't on the DLL search path "
+                    "(see CLAUDE.md issue #1)."
+                )
 
 
 # ---- Job worker ------------------------------------------------------------

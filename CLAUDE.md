@@ -445,6 +445,114 @@ The auto-extract reference logic stores `numpy` embeddings in a list of
 tuples. Make sure the list outlives the loop that builds it — losing
 the reference makes `np.dot` later return wrong shapes.
 
+### 8. ONNX Runtime "fallback to CPU" silent disaster
+
+When you give onnxruntime a list like `[("TensorrtExecutionProvider",
+{...}), "CUDAExecutionProvider", "CPUExecutionProvider"]` and the FIRST
+provider fails to initialise (TRT lib missing, cuDNN missing, etc.),
+**onnxruntime does NOT fall through to the next provider in your list**
+— it falls all the way to **CPU only**. This is silent (just a one-line
+`EP Error... Falling back to ['CPUExecutionProvider'] and retrying.`
+in stderr) and you'll spend forever wondering why your 4090 is at 0 %
+util.
+
+Defence in depth in `_ensure_models()`:
+
+1. **Detect TRT availability** before listing it as a provider:
+   ```python
+   try:
+       import tensorrt  # noqa
+       trt_available = "TensorrtExecutionProvider" in ort.get_available_providers()
+   except ImportError:
+       trt_available = False
+   ```
+   Don't put TRT in the providers list unless `trt_available` is true.
+
+2. **Verify the active provider after load**:
+   ```python
+   active = _swapper.session.get_providers()
+   if active == ["CPUExecutionProvider"]:
+       raise RuntimeError("inswapper loaded on CPU only — CUDA failed")
+   ```
+   Better to crash startup than silently grind frames at 1 fps.
+
+3. The face analyser uses CUDA (not TRT) because some of its models have
+   dynamic-shape inputs (`det_10g.onnx` has `'?'` dims) that TRT can't
+   compile efficiently. CUDA is plenty fast at 640×640 anyway.
+
+### 9. TensorRT DLL discovery
+
+`tensorrt-cu12` puts its DLLs at `<env>/Lib/site-packages/tensorrt_libs/`
+— a different layout from the other `nvidia-*-cu12` packages (which put
+DLLs at `nvidia/<lib>/bin/`). The DLL discovery loop in `webapp.py` /
+`stream-swap.py` includes BOTH paths:
+
+```python
+_bin_dirs = [
+    *(os.path.join(_sp, "nvidia", sub, "bin")
+      for sub in ("cudnn", "cublas", "cuda_runtime", "curand", "cufft",
+                  "cuda_nvrtc", "nvjitlink")),
+    os.path.join(_sp, "tensorrt_libs"),  # TRT — different layout
+]
+```
+
+If you add another nvidia-* package with yet another layout, append it
+here.
+
+### 10. TRT engine build holds the GIL
+
+While ONNX Runtime / TensorRT compiles a TRT engine on first run
+(~60–90 s for inswapper), the C++ side does CPU-bound work that
+sometimes holds the Python GIL. Flask's threaded request handlers
+become slow during this window. The page-load timeout in test scripts
+should account for this — wait at least 90 s after a fresh restart
+before declaring the server dead.
+
+This only happens once per cache directory; the engine is then
+serialised to `webapp_jobs/.trt_cache/` and reused.
+
+### 11. Browser autoplay rescue (UX, not a crash)
+
+`<video>.play()` can be silently rejected by the browser's autoplay
+policy if the user hasn't interacted with the page yet — even when
+`muted=true`. Symptom: video is decoded, ready, but `paused=true` and
+the player looks "stuck on a frame". The previous Playwright debug
+showed `readyState=4, currentTime=91.75, paused=false, muted=true` —
+i.e. it WAS playing once user clicked, but the first attempt had
+silently failed.
+
+Three layers of mitigation in `VIEWER_HTML`:
+
+```html
+<video id="player" playsinline controls muted autoplay></video>
+```
+- `muted autoplay` HTML attributes — browsers handle these via the
+  declarative path more permissively than calling `play()` from JS.
+
+```js
+function tryStartPlayback() {
+  if (playStarted) return;
+  if (bufferedAhead() < PREBUFFER_TARGET) return;
+  player.muted = true;
+  player.play()
+    .then(() => { playStarted = true; /* show unmute pill */ })
+    .catch(err => setTimeout(tryStartPlayback, 1000));   // RETRY!
+}
+```
+- Set `playStarted = true` only **after** the promise resolves —
+  otherwise a rejection leaves `playStarted` stuck at true and we
+  never retry.
+
+```js
+document.addEventListener('click', () => {
+  if (!playStarted && bufferedAhead() >= 1) {
+    player.muted = true; player.play().then(() => playStarted = true);
+  }
+});
+```
+- Universal click-anywhere rescue: if Chrome refuses every autoplay
+  attempt, one click anywhere on the page kicks playback alive.
+
 ---
 
 ## Troubleshooting matrix
@@ -462,6 +570,9 @@ the reference makes `np.dot` later return wrong shapes.
 | Audio + video desync | n/a | Expected when swap is much slower than realtime. Reduce target resolution before upload, or use Path A for offline-quality output |
 | `gh repo create` says "already exists" | `gh repo view` | Repo was created previously; just `git push` |
 | `gh push` 403 | `gh auth status` | Re-auth: `gh auth login` |
+| GPU at 0%, CPU at 70%+ during a job | Webapp log: look for `inswapper active providers` | If line is `['CPUExecutionProvider']`, your TRT (or cuDNN) lib failed to load and ORT silently fell to CPU. See issue #8. Fix: install `tensorrt-cu12`, or remove TRT from providers list and rely on CUDA |
+| Inswapper takes forever to load on first run | (normal) | TRT is building the engine (~60–90 s). Subsequent runs reuse cached engine in `webapp_jobs/.trt_cache/` |
+| Live player looks blank but progress bar advances | Playwright: `evaluate("document.getElementById('player').paused")` | If `paused=true` and `readyState=4`: autoplay policy blocked initial play(). Click anywhere on the page — code retries play() on every click. The "Click to unmute" pill in the bottom-left also unblocks it |
 | Webapp won't bind 8080 | `Get-NetTCPConnection -LocalPort 8080` | Another process is using it. Change `app.run(port=8080)` to another port, or kill the other process |
 | Out-of-memory on GPU | `nvidia-smi` | Models hold ~5 GB; if other CUDA processes (Stable Diffusion, etc.) are running, kill them. Or restart your machine |
 | `ImportError: DLL load failed while importing onnxruntime` | (cmd) | Same root cause as cuDNN — see issue #1 |
@@ -472,26 +583,42 @@ the reference makes `np.dot` later return wrong shapes.
 
 Observed on RTX 4090 Laptop (16 GB VRAM):
 
-| Resolution | Swap fps (wall-clock) | VRAM | Comments |
+| Resolution | CUDA-only fps | TensorRT FP16 fps | VRAM |
 |---|---|---|---|
-| 480×360  | 25-30 | 4.5 GB | matches realtime |
-| 640×480  | 18-22 | 4.8 GB | half-realtime; pre-buffer covers it |
-| 1280×720 | 8-12  | 5.5 GB | pre-buffer is essential |
-| 1920×1080| 5-8   | 6.2 GB | very slow; consider Path A for these |
+| 480×360  | 25-30 | 35-45 | 4.5 GB |
+| 640×480  | 18-22 | 28-35 | 4.8 GB |
+| 1280×720 | 8-12  | 14-20 | 5.5 GB |
+| 1920×1080| 5-8   | 9-13  | 6.2 GB |
 
 Bottleneck is `inswapper_128` inference (the 128×128 swap, then
 `paste_back=True`'s warp). InsightFace face detection is faster.
 
-If you want to speed it up:
+### TensorRT (recommended on RTX cards)
 
-- **Use TensorRT execution provider** instead of CUDA — `inswapper`
-  benchmarks at ~30 % faster with TRT. Requires building TRT engines
-  the first time (~2 min). Not enabled by default because of build-time
-  cost.
-- **Skip-frame mode**: process every Nth frame, interpolate the rest.
-  Halves quality but doubles speed. Not implemented.
-- **Lower `det_size`** (default 640). 480 detects fewer small faces but
-  is faster.
+If `tensorrt-cu12` is installed in the env (it's listed in
+`requirements-webapp.txt`), `webapp.py` automatically uses TensorRT for
+the inswapper. First run builds the engine (~60–90 s); cached to
+`webapp_jobs/.trt_cache/` thereafter. Worth ~30–50 % throughput uplift.
+
+Install (if missing):
+```powershell
+conda run -n dlc pip install tensorrt-cu12
+```
+~2 GB download. Restart `webapp.py` — it'll auto-detect.
+
+If TRT is **not** present, the code stays on CUDA-only (don't let it
+fall back to CPU; see issue #8).
+
+### Other speedups (not enabled by default)
+
+- **NVDEC for video decode** — `cv2.VideoCapture` is software decode.
+  Switch to PyAV with `hwaccel=cuda` for ~10–20 % I/O savings.
+- **Lower `det_size` to 480** — face detector input. Faster, may miss
+  small faces in dance/wide shots.
+- **Smaller face model `buffalo_s`** — ~2× faster than `buffalo_l`,
+  slightly lower accuracy.
+- **Frame-skip + interpolate** — process every 2nd frame, copy swap to
+  the in-between. Doubles speed; visible artefacts on fast cuts.
 
 ---
 

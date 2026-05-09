@@ -23,3 +23,8 @@ nvidia-nvjitlink-cu12
 
 # Web app
 flask>=3.0
+
+# TensorRT execution provider for the inswapper (~30-50% throughput uplift on
+# RTX cards). Optional — if absent, webapp.py auto-falls back to CUDA-only.
+# Large download (~2 GB) and only useful with NVIDIA GPU.
+tensorrt-cu12>=10.0
