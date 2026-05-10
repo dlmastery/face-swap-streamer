@@ -5,6 +5,100 @@ introduced them and the lessons each one taught.
 
 ---
 
+## v0.10 — C++ CLI port (offline batch swap, no Python at runtime)
+
+**`cli/`** — fresh top-level directory.
+
+A re-implementation of the entire swap pipeline in modern C++ (MSVC
+14.4 / C++20). Same model files as the Python build (buffalo_l +
+inswapper_128_fp16). Lives next to the existing Flask + FastAPI
+servers, doesn't replace them.
+
+What the CLI does:
+- `--male m.jpg --female f.jpg --video clip.mp4 --output out/`
+- `--male m.jpg --dir clips/ --output out/ --concurrency 2`
+- Detects faces, extracts a per-gender reference cluster from the video,
+  swaps every match, muxes the original audio back, writes
+  `<basename>_swapped.mp4` with `+faststart`.
+- `--concurrency N` runs N independent pipelines on the same GPU; ORT
+  serializes the actual inference calls but C++ has no GIL so all the
+  CPU work (read, paste-back, encode, queueing) overlaps freely.
+
+Components:
+- `OnnxSession` — RAII wrapper around `Ort::Session` with CUDA / TRT /
+  CPU fallback chain.
+- `FaceAnalyser` — RetinaFace decode + arcface embedding + genderage.
+  `decode_retinaface` ports SCRFD anchor + bbox + 5-kps decode + NMS;
+  identifies score / bbox / kps outputs by last-dim shape (1 / 4 / 10)
+  so naming differences across exporters don't matter.
+- `Inswapper` — 5-pt similarity-warp to 128×128, ONNX inference,
+  feathered paste-back. Loads the 512×512 emap matrix from
+  `cli/models/inswapper_emap.bin` (extracted once via
+  `cli/scripts/extract_emap.py`) and applies it before session.run.
+- `extract_reference_embeddings` — port of the Python algorithm:
+  sample frames, cluster by gender, greedy-pick the largest unclaimed
+  cluster per source so two same-gender faces don't fight over the
+  same recurring person.
+- `BoundedQueue<T>` + `run_streaming` — 4-stage pipeline (reader →
+  detect → swap → encode) with bounded queues between stages.
+- `run_batch` — N `run_streaming` instances on a thread pool sharing
+  the model sessions.
+- `FfmpegEncoder` — Win32 `CreateProcess` (POSIX `fork`+`execvp` on
+  Linux) + raw BGR pixel pipe + audio-track mux from the source mp4.
+
+Provisioning (`cli/scripts/setup.ps1`): winget cmake + MSVC Build Tools
+2022, downloads ORT 1.18.1 win-x64-gpu + OpenCV 4.10.0 windows pack
+into `cli/third_party/`, copies buffalo_l + inswapper from
+`~/.insightface/models/` into `cli/models/`. ORT and OpenCV downloads
+both pass `--ssl-no-revoke` because schannel's strict OCSP fails on
+corporate-managed Windows boxes.
+
+Build (`cli/scripts/build.ps1`): loads `vcvars64.bat` automatically,
+`cmake -G "Visual Studio 17 2022" -A x64`, `cmake --build --config
+Release --parallel`. POST_BUILD steps copy ORT + OpenCV DLLs alongside
+the exe.
+
+Bugs that took multiple smoke tests to surface (full prose in
+CLAUDE.md issues #15-22):
+
+- **#15 pimpl + `unique_ptr<Impl>`**: `= default` ctor in the header
+  triggers `C2027 use of undefined type 'Impl'` because MSVC tries to
+  instantiate `unique_ptr::~unique_ptr` at the call site. Fix: declare
+  the ctor in the header, define it in the `.cpp`.
+- **#16 emap transform**: missing the `latent = src_emb @ emap` step
+  before `inswapper.run` produces face-shaped pixels but with the
+  wrong identity. emap is the *last* graph initializer of the ONNX
+  model, not in any Python file directly.
+- **#17 inswapper alignment template**: the 128 template is the 112
+  template **shifted by +8 in X**, not scaled by 128/112. Wrong scale
+  puts chin landmarks ~13 px too low → visibly bad jaw blending.
+- **#18 paste-back blur kernel**: Python's `k` is the half-kernel; the
+  actual `cv2.GaussianBlur` size is `(2k+1, 2k+1)`. Using `k` directly
+  leaves a soft seam at 1080p.
+- **#19 ORT 1.18 forward decls** are `struct`, not `class` (C4099).
+- **#20 anaconda ffmpeg.exe** can't run outside its conda env (DLL
+  discovery). Use gyan.dev's winget build via `FFMPEG_BIN`.
+- **#21 schannel CRYPT_E_NO_REVOCATION_CHECK** intermittently kills
+  GitHub release downloads on corporate-managed boxes.
+  `--ssl-no-revoke`.
+- **#22 PowerShell `$PID`** is read-only. `foreach ($pid in $list)`
+  errors with `Cannot overwrite variable PID`. Use `$id`.
+
+Performance on RTX 4090 Laptop, 1080p Bollywood input
+(Pal-Pal-Dil-Ke-Paas):
+- Single-stream: 16.7 fps wall-clock end-to-end
+- `--concurrency 2`: ~33 fps aggregate (~2× scaling)
+- vs Python pipeline at the same input: ~8-13 fps single-stream → C++
+  CLI is ~1.6× faster single-stream and ~2.5-4× faster at concurrency 2
+
+The CLI is *not* a replacement for the Python web app — it's for
+headless batch processing where a browser viewer isn't needed. The web
+app remains the reference for *correctness*; if a regression shows up
+in C++ output, compare against the Flask `_swapped.mp4` for the same
+input.
+
+---
+
 ## v0.7 — Real downloadable MP4
 
 **`40ba7a1` Fix: produce a real MP4 (mobile + VLC compatible), not a fragmented one**

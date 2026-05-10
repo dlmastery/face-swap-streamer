@@ -63,6 +63,13 @@ latest_swapped_frame.jpg
 _t.onnx
 _cuda_test.onnx
 
+# --- C++ CLI build artifacts + provisioned deps (downloaded by cli/scripts/setup.ps1)
+cli/build/
+cli/third_party/
+cli/models/
+cli/out_test/
+cli/out_batch/
+
 # --- Misc
 *.tmp
 *.bak

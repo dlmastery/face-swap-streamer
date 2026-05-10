@@ -233,16 +233,17 @@ and the speedups that didn't pan out.
 
 ---
 
-## Three CLI fallback paths
+## CLI fallback paths
 
-The repo also wraps two upstream tools as PowerShell helpers, in case
-you'd rather not use the web app:
+The repo also includes wrappers for upstream tools and a from-scratch
+C++ CLI, in case you'd rather not use the web app:
 
 | Path | Tool | What it does | Wrapper |
 |---|---|---|---|
 | **A** | [FaceFusion 3.6](https://github.com/facefusion/facefusion) | Highest-quality offline render with the full processor chain (face_swapper + face_enhancer + expression_restorer + frame_enhancer) | `swap-song.ps1`, `swap-album.ps1` |
 | **B** | [Deep-Live-Cam 2.1.2](https://github.com/hacksider/Deep-Live-Cam) | Real-time GUI swap (webcam + virtual camera) | `play-song.ps1` |
 | **C** | OBS Studio (separate install) | Loop a swapped MP4 as a virtual webcam for Discord / Zoom / Teams | `OBS-setup.md` |
+| **D** | **C++ CLI** (this repo, `cli/`) | Headless batch face-swap, no Python at runtime. Multi-video parallel pipelines on the same GPU (`--concurrency N`). ~1.6× faster single-stream and ~2.5–4× faster at concurrency 2 vs the Python pipeline at 1080p. | `cli/build/bin/Release/faceswap.exe`. See `cli/README.md` for build + flags. |
 
 These are independent of the web app — if you only want the web app,
 ignore them.

@@ -152,17 +152,21 @@ the browser with synchronised audio while it's still being processed**
 (HLS via ffmpeg's tee muxer). When the swap finishes, the user
 downloads the muxed MP4.
 
-Three independent paths share the repo:
+Several independent paths share the repo:
 
 | Path | Tool | Purpose |
 |---|---|---|
 | **A** | FaceFusion 3.6 | Highest-quality offline render via CLI |
 | **B** | Deep-Live-Cam 2.1.2 | Real-time GUI swap (webcam / virtual camera) |
 | **C** | OBS Studio | Loop a swapped MP4 into a virtual webcam |
-| **★** | **`webapp.py`** | **The web app — what most of this repo is about** |
+| **★** | **`webapp.py`** (Flask :8080) | **Original web app — most documented path** |
+| **★★** | **FastAPI :8081 + Next.js :3000** (`server/`, `web/`) | **Production-grade rewrite** with batch upload + WebSocket status + ZIP download |
+| **CLI** | **`cli/faceswap.exe`** | **C++ port** of the swap pipeline for batch / headless use, no Python required |
 
 The web app reuses Deep-Live-Cam's `insightface` install but is its own
-codepath; it doesn't shell out to FaceFusion or DLC.
+codepath; it doesn't shell out to FaceFusion or DLC. The C++ CLI is a
+fresh re-implementation (RetinaFace decode, arcface alignment, inswapper,
+paste-back, ffmpeg I/O) — same model files, different runtime.
 
 ---
 
@@ -234,6 +238,14 @@ env.
 | `requirements-facefusion.txt` | CUDA runtime libs for the `faceswap` env beyond what FaceFusion's `install.py` installs |
 | `OBS-setup.md` | Path C walk-through (no code) |
 | `webapp_jobs/<id>/` | Per-job working dir: source.jpg, target.mp4, hls/, swapped.mp4, ffmpeg.log |
+| `server/main.py`, `server/worker.py`, `server/schemas.py` | FastAPI rewrite (port 8081). Worker module shares ML pipeline with Flask via the same insightface session; HTTP/WebSocket layer is async/Pydantic. |
+| `server/jobs/<id>/` | FastAPI per-job working dir (analogous to `webapp_jobs/`) |
+| `web/` | Next.js 16 frontend (port 3000). App router, hls.js viewer, multi-file uploader, batch viewer, WebSocket client. |
+| `cli/CMakeLists.txt`, `cli/include/`, `cli/src/` | **C++ CLI**. Headers + cpp for `OnnxSession`, `FaceAnalyser` (RetinaFace + arcface + genderage), `Inswapper`, `extract_reference_embeddings`, `run_streaming` / `run_batch`, `FfmpegEncoder`, plus `main.cpp`. |
+| `cli/scripts/setup.ps1` | One-shot installer for the C++ build: winget cmake + MSVC, downloads ONNX Runtime 1.18.1 + OpenCV 4.10.0 win pack into `cli/third_party/`, copies `buffalo_l/` + inswapper into `cli/models/`. |
+| `cli/scripts/build.ps1` | Loads `vcvars64.bat`, runs `cmake -G "Visual Studio 17 2022"`, builds Release. |
+| `cli/scripts/extract_emap.py` | One-time helper: pulls the 512×512 emap matrix out of `inswapper_128_fp16.onnx` (its last graph initializer) into `cli/models/inswapper_emap.bin` so the C++ Inswapper can apply the arcface→latent transform. |
+| `cli/README.md` | Build instructions, flag reference, batch tuning table. |
 
 ---
 
@@ -293,6 +305,45 @@ conda run -n dlc python stream-swap.py `
 ```
 Outputs to a `ffplay` window. Add `--web` for a small built-in MJPEG
 http server instead.
+
+### Run the C++ CLI (offline batch swap, no Python required at runtime)
+
+One-time build (~10 min — fetches ORT 1.18.1 + OpenCV 4.10.0):
+```powershell
+pwsh -File cli/scripts/setup.ps1     # winget cmake + MSVC, downloads deps
+conda run -n dlc python cli/scripts/extract_emap.py   # one-time emap dump
+pwsh -File cli/scripts/build.ps1     # cmake configure + Release build
+```
+
+Single-video run:
+```powershell
+$env:FFMPEG_BIN = "C:\Users\<u>\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-8.1-full_build\bin\ffmpeg.exe"
+.\cli\build\bin\Release\faceswap.exe `
+    --male  .\source\sreeni.jpg `
+    --video .\songs\song.mp4 `
+    --output .\out\
+```
+
+Batch run (N videos in parallel on the same GPU):
+```powershell
+.\cli\build\bin\Release\faceswap.exe `
+    --male  .\source\sreeni.jpg `
+    --female .\source\her.jpg `
+    --dir   .\songs\ `
+    --output .\out\ `
+    --concurrency 2
+```
+
+Observed perf on RTX 4090 Laptop, 1080p input:
+- `--concurrency 1`: ~16-17 fps wall-clock (single-stream)
+- `--concurrency 2`: ~33 fps aggregate (two pipelines × ~16-17 fps)
+- bottleneck above 2 is GPU; CPU paste-back has plenty of headroom
+
+The CLI shares its model files and inswapper math with the Python web
+app, but its swap math went through a few fix-up passes (see
+`Things that broke before` issues #16, #17, #18) — if a regression
+shows up vs the Python output, the suspect order is: emap → alignment
+template → blur kernel.
 
 ### Verify CUDA actually loaded
 ```powershell
@@ -645,6 +696,132 @@ document.addEventListener('click', () => {
 ```
 - Universal click-anywhere rescue: if Chrome refuses every autoplay
   attempt, one click anywhere on the page kicks playback alive.
+
+### 15. C++ pimpl + `unique_ptr<Impl>` needs ctor in `.cpp`
+
+`FfmpegEncoder` (and `OnnxSession`) use the pimpl idiom with
+`std::unique_ptr<Impl> p`. If you `= default` the *constructor* in the
+header, MSVC instantiates `unique_ptr<Impl>::~unique_ptr` *at the call
+site* — where `Impl` is incomplete — and you get
+`C2027 use of undefined type 'Impl'` and `C2338 can't delete an
+incomplete type`.
+
+Fix: declare `FfmpegEncoder();` in the header, define
+`FfmpegEncoder::FfmpegEncoder() = default;` in the `.cpp` (where `Impl`
+is complete). Same rule for `~FfmpegEncoder() = default;` and any
+defaulted move ops.
+
+### 16. C++ inswapper without the emap transform → garbage swaps
+
+The Python `inswapper.get()` does an extra step that's *not* in the
+ONNX model:
+
+```python
+latent = source_face.normed_embedding.reshape((1,-1))
+latent = np.dot(latent, self.emap)        # 512×512 matrix
+latent /= np.linalg.norm(latent)
+pred = session.run(..., {input_names[1]: latent})
+```
+
+`emap` is the **last graph initializer** in `inswapper_128_fp16.onnx`
+(a 512×512 float32 matrix). It transforms arcface embeddings into the
+inswapper's own latent space. If you feed the raw arcface embedding
+straight to the model, you get visually-broken swaps that *look* like
+they're working (output has face-shaped pixels) but the identity is
+wrong and edges are degenerate.
+
+The C++ port pre-extracts emap once via `cli/scripts/extract_emap.py`
+into `cli/models/inswapper_emap.bin`, then `Inswapper::transform_embedding`
+loads it at startup and applies `latent = src_emb @ emap; latent /= ||latent||`
+before each `session.run`. **Do not skip this even if the swap "looks
+plausible" without it.**
+
+### 17. C++ inswapper alignment template — +8 X shift, NOT a 128/112 scale
+
+The 5-point destination kps for the 128×128 inswapper crop come from
+`insightface/utils/face_align.py::estimate_norm`:
+
+```python
+if image_size % 128 == 0:                 # ← inswapper hits this
+    ratio = float(image_size) / 128.0    # = 1.0 for 128
+    diff_x = 8.0 * ratio                 # = 8.0
+dst = arcface_dst * ratio                 # arcface_dst unchanged
+dst[:, 0] += diff_x                       # shift X by +8
+```
+
+So at 128 the template is **the unscaled 112-arcface template, X-shifted
+by +8** — *not* `arcface_dst * (128/112)`. The wrong scale puts the chin
+landmarks ~13 px too low, which produces visibly misaligned chin/jaw
+swaps that look like a regression vs Python.
+
+Correct:
+```cpp
+const std::array<cv::Point2f, 5> kInswapperDst = {{
+    {46.2946f, 51.6963f}, {81.5318f, 51.5014f}, {64.0252f, 71.7366f},
+    {49.5493f, 92.3655f}, {78.7299f, 92.2041f},
+}};
+```
+
+### 18. C++ paste-back: `2k+1`, not `k`, for the Gaussian blur kernel
+
+Python's `inswapper.py` paste-back computes the blur kernel like this:
+
+```python
+k = max(mask_size // 20, 5)
+blur_size = tuple(2*i + 1 for i in (k, k))
+img_white = cv2.GaussianBlur(img_white, blur_size, 0)
+```
+
+`k` is the *half-kernel*; the actual kernel size is `2k+1`. If you copy
+that to C++ and pass `k` directly to `cv::GaussianBlur`, your blur radius
+is roughly half what Python uses, and you can see the swap-mask edge as
+a soft seam at 1080p. Same `mask_size = sqrt(mask_h * mask_w)` formula
+on a bbox span that's `(max-min)`, not `(width)` (off-by-one matters at
+small face sizes).
+
+### 19. ORT 1.18 forward declarations: `struct`, not `class`
+
+`Ort::Env`, `Ort::Session`, `Ort::SessionOptions` are declared as
+`struct` in ORT 1.18's `onnxruntime_cxx_api.h`. If you forward-declare
+them as `class` in your header, MSVC issues C4099 warnings. Use
+`namespace Ort { struct Session; struct Env; struct SessionOptions; }`
+(or include the full header in your `.cpp`).
+
+### 20. Anaconda's bundled `ffmpeg.exe` is broken outside the conda env
+
+`C:\Users\<u>\anaconda3\Library\bin\ffmpeg.exe` runs but fails with
+`error while loading shared libraries: ?: cannot open shared object
+file: No such file or directory` if you call it without conda
+activation (it can't find its dependent DLLs from the conda Library
+tree). For the C++ CLI we use the gyan.dev winget build instead:
+
+```
+C:\Users\<u>\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_..._8wekyb3d8bbwe\ffmpeg-X.Y-full_build\bin\ffmpeg.exe
+```
+
+…and pass that as `FFMPEG_BIN` env var. Gyan's full build is
+self-contained, has libx264 + h264_nvenc + aac, no DLL dependencies.
+
+### 21. `curl` on Windows + corporate-issued root certs → revocation check fails
+
+```
+curl: (35) schannel: next InitializeSecurityContext failed:
+CRYPT_E_NO_REVOCATION_CHECK (0x80092012)
+```
+
+Symptom: GitHub release downloads (ORT, OpenCV) intermittently 0-byte
+or never start. Root cause: schannel's strict OCSP revocation policy
+hits a TLS cert it can't get a CRL for (common with MDM-managed
+machines). Fix: pass `--ssl-no-revoke` to curl. We use this in
+`cli/scripts/setup.ps1`'s download step.
+
+### 22. PowerShell auto-variable `$PID` is read-only
+
+Don't write `foreach ($pid in $list)` — PowerShell's built-in `$PID`
+is read-only and you'll get
+`Cannot overwrite variable PID because it is read-only or constant`.
+Use `$id` or `$processId` instead. Same applies to `$HOME`, `$PWD`,
+and a few others.
 
 ---
 
