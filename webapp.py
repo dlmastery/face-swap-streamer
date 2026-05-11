@@ -16,6 +16,7 @@ import uuid
 import threading
 import queue
 import subprocess
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -104,6 +105,36 @@ class Job:
     started: float = field(default_factory=time.time)
     finished: float = 0.0
     stop_flag: threading.Event = field(default_factory=threading.Event)
+    timers: dict = field(default_factory=dict)   # name -> StageTimer; populated in _run_job
+
+
+class StageTimer:
+    """Lightweight running stats for a pipeline stage.
+
+    Each stage records elapsed ms per frame. A 250-frame ring keeps
+    p50/p95 reflective of the last ~10-30 seconds without unbounded memory.
+    """
+    def __init__(self, name: str, ring_size: int = 250):
+        self.name = name
+        self._ring: deque[float] = deque(maxlen=ring_size)
+        self._lock = threading.Lock()
+        self.n_total = 0
+
+    def record(self, ms: float) -> None:
+        with self._lock:
+            self._ring.append(ms)
+            self.n_total += 1
+
+    def snapshot(self) -> dict:
+        with self._lock:
+            if not self._ring:
+                return {"name": self.name, "n_total": 0}
+            buf = sorted(self._ring)
+        p50 = buf[len(buf) // 2]
+        p95 = buf[int(len(buf) * 0.95)] if len(buf) >= 20 else buf[-1]
+        return {"name": self.name, "n_total": self.n_total,
+                "p50_ms": round(p50, 2), "p95_ms": round(p95, 2),
+                "max_ms": round(buf[-1], 2)}
 
 
 JOBS: dict[str, Job] = {}
