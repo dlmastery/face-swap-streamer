@@ -267,11 +267,17 @@ def worker_main(
 
         # Unpickle reference embeddings + source faces (master computed these once).
         # ref_embs: (S, D) float32 normed embeddings, one row per source.
-        # ref_sources: list[dict] with key 'src_face' holding the source-image Face
-        #              that inswapper will read identity from. We pass dicts (not the
-        #              SourceSpec dataclass) so this module has no webapp dependency.
+        # ref_sources_raw: list[dict] with key 'src_face_dict' holding the source-image
+        #                  Face as a plain dict (insightface.Face.__reduce__ is buggy
+        #                  across the spawn boundary — we re-wrap as Face here, where
+        #                  insightface is already imported).
+        from insightface.app.common import Face
         ref_embs = pickle.loads(ref_embs_bytes)
-        ref_sources = pickle.loads(ref_sources_pickled)
+        ref_sources_raw = pickle.loads(ref_sources_pickled)
+        ref_sources = [
+            {"src_face": Face(s["src_face_dict"]), "gender": s["gender"]}
+            for s in ref_sources_raw
+        ]
         ref_embs_T = ref_embs.T  # (D, S) — pre-transpose for the per-frame matmul
 
         # Attach the shared-memory slots and build per-slot numpy views ONCE.

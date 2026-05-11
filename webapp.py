@@ -482,10 +482,14 @@ def _run_job(job: Job):
         job.timers = timers
 
         # Pickle reference embeddings and per-source src_face for the workers.
-        # SourceSpec is a dataclass; we hand the worker just the bits it needs
-        # (its module has no webapp dependency).
+        # SourceSpec is a dataclass; we hand the worker just the bits it needs.
+        # insightface.Face has a finicky __reduce__ (it ends up calling a None
+        # constructor in a worker process); convert to a plain dict here and the
+        # worker re-wraps as Face after insightface is imported.
+        def _face_to_dict(f):
+            return {k: f[k] for k in f.keys()}
         ref_sources_for_workers = [
-            {"src_face": s.src_face, "gender": s.gender}
+            {"src_face_dict": _face_to_dict(s.src_face), "gender": s.gender}
             for s in job.sources
         ]
         ref_embs_bytes = pickle.dumps(ref_embs)
