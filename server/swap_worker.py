@@ -104,14 +104,107 @@ class SwapResponse:
 
 
 class FramePool:
-    """Placeholder — Sub-task 5.2 fleshes this into a real shared-memory pool.
+    """Pool of fixed-size shared-memory slots backing one BGR frame each.
 
-    Will own a list[SharedMemory] of fixed-size BGR slots, hand out free
-    slots to the master for frame decode, and recycle them once the
-    master has written the swapped frame to ffmpeg.
+    Owned by the master process; workers `attach` to slots by name via
+    `multiprocessing.shared_memory.SharedMemory(name=...)`. Each slot is
+    a contiguous uint8 buffer sized to fit `H * W * 3` bytes; the same
+    buffer holds the input frame on dispatch and the swapped output on
+    return (workers overwrite in place; master copies out to ffmpeg
+    before recycling the slot).
+
+    Sizing: at 1080p one slot is ~6.2 MB. With N_workers=4 and 4 slots
+    per worker (16 slots) that's ~100 MB of pinned shared RAM — fine.
+
+    Lifecycle from the master's POV:
+        pool = FramePool(n_slots=N_workers * 4, shape=(H, W, 3))
+        slot = pool.acquire()                 # blocks if pool empty
+        arr  = pool.view(slot)                # numpy view, no copy
+        arr[...] = decoded_frame              # fill in place
+        in_q.put(SwapRequest(frame_idx=k, slot_id=slot))
+        # ... worker processes, writes result back into the same slot ...
+        resp = out_q.get()
+        out_arr = pool.view(resp.slot_id)
+        ffmpeg.stdin.write(out_arr.tobytes()) # or out_arr.copy() first
+        pool.release(resp.slot_id)            # back into the free pool
+
+    Workers never call acquire/release — they just `view(slot_id)` the
+    slot the master picked, mutate it in place, and ack.
+
+    Cleanup: `close()` releases the SharedMemory handles; on Windows
+    Python's reference counter unlinks them when the last handle is
+    dropped. We additionally call `unlink()` defensively on master shutdown
+    because dangling shm names linger across process crashes on some
+    Windows builds.
     """
-    def __init__(self):
-        raise NotImplementedError("FramePool — wired in sub-task 5.2")
+
+    def __init__(self, n_slots: int, shape: tuple, dtype=None):
+        import numpy as np
+        from multiprocessing import shared_memory
+        if dtype is None:
+            dtype = np.uint8
+        self.n_slots = int(n_slots)
+        self.shape = tuple(shape)
+        self.dtype = np.dtype(dtype)
+        self._np = np
+        self._shm_mod = shared_memory
+
+        nbytes = int(np.prod(self.shape) * self.dtype.itemsize)
+        self.nbytes = nbytes
+        self._shms = []                # list[SharedMemory]
+        self._views = []               # list[np.ndarray] — one per slot
+        for _ in range(self.n_slots):
+            shm = shared_memory.SharedMemory(create=True, size=nbytes)
+            self._shms.append(shm)
+            self._views.append(
+                np.ndarray(self.shape, dtype=self.dtype, buffer=shm.buf)
+            )
+
+        # Free-slot pool. Uses a thread-safe Queue so the master's
+        # demux thread can `acquire()` (block on empty) while a
+        # background result-drainer calls `release()` from another
+        # thread. We keep it bounded to n_slots so accidental
+        # double-release is loud (`Full`) instead of silent.
+        import queue as _queue
+        self._free: "_queue.Queue[int]" = _queue.Queue(maxsize=self.n_slots)
+        for i in range(self.n_slots):
+            self._free.put(i)
+
+    @property
+    def names(self) -> list:
+        """Pass these to each worker so it can attach to the same slots."""
+        return [s.name for s in self._shms]
+
+    def acquire(self, timeout: Optional[float] = None) -> int:
+        """Block until a slot is free; return its id. `timeout=None` waits
+        forever; pass a small timeout to detect master stalls."""
+        return self._free.get(timeout=timeout)
+
+    def release(self, slot_id: int) -> None:
+        """Return a slot to the free pool. Raises queue.Full on double-release."""
+        self._free.put_nowait(int(slot_id))
+
+    def view(self, slot_id: int):
+        """Zero-copy numpy view of the slot. Master and worker both call this."""
+        return self._views[int(slot_id)]
+
+    def free_count(self) -> int:
+        return self._free.qsize()
+
+    def close(self) -> None:
+        """Drop all SharedMemory handles + unlink on POSIX/Windows. Idempotent."""
+        for shm in self._shms:
+            try:
+                shm.close()
+            except Exception:
+                pass
+            try:
+                shm.unlink()
+            except (FileNotFoundError, OSError):
+                # Already unlinked, or platform doesn't require it.
+                pass
+        self._shms.clear()
+        self._views.clear()
 
 
 # ---- Worker entry point ----------------------------------------------------
