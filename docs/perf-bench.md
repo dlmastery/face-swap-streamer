@@ -11,7 +11,12 @@ Each row records the timer snapshot at the **end** of the swap stream (just befo
 | 2 (NVENC output) | 4.1 | 9.12 | 111.43 | 333.28 | n/a | 1.33 | 0–35% (swap-bound) | 0% sampled (idle waiting on swap) | 0% | 313 | h264_nvenc active per ffmpeg log; no proc_fps gain because writer wasn't bottleneck. Win is freed CPU for Phase 3 paste-back. |
 | ~~3 (paste-back split)~~ | **3.5 ❌ regression** | 14.51 | 120.06 | 19.37 | 259.27 | 4.28 | not sampled | n/a | n/a | 313 | **REVERTED.** Implemented + reviewed but throughput dropped vs Phase 2 (4.1 → 3.5). See note below. |
 | 4 (face batching) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | batched ORT call when ≥2 faces/frame |
-| 5 (multiproc N=4) | TBD | TBD | n/a | n/a | n/a | TBD | TBD | TBD | TBD | TBD | 4 worker processes via shared_memory; "detect/swap/paste" replaced by per-worker `worker_total` (master-side dispatch -> result_collected). |
+| 5 N=4 (clip_20s) | 9.8 | 9.06 | n/a | n/a | n/a | 5.30 | 55-81% | active | n/a | 313 | warmup 20.5s; 4 worker processes; worker_total p50=1744ms (4 frames parallel) |
+| 5 N=2 (clip_20s) | 6.5 | — | n/a | n/a | n/a | — | 16-48% | active | n/a | 313 | warmup 14s; 1.6× scaling vs Phase 2 |
+| 5 N=6 (clip_20s) | 11.3 | — | n/a | n/a | n/a | — | 32-84% | active | n/a | 313 | warmup 32s; 2.7× scaling; peak per-test sample |
+| 5 N=8 (clip_20s) | crash | — | — | — | — | — | — | — | — | — | worker 0 fails: protobuf DecodeError during onnx.load even with 1s stagger; needs `multiprocessing.Lock` around model load. Deferred. |
+| 5 N=6 det_size=480 (clip_20s) | 11.8 | — | n/a | n/a | n/a | — | 2-17% | active | n/a | 313 | det_size win small at 1080p (only +5%); swap dominates |
+| **5 N=6 det_size=480 FULL 5min song** | **33.0** ⭐ | — | n/a | n/a | n/a | — | **87-95%** | active | n/a | 1682 | **PEAK** — warmup amortized over 7902 frames; pipeline reaches steady state; **GPU truly saturated**. Wall-clock 290s for 316s of footage → swap faster than realtime. |
 | 6 (NVDEC input) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | >0% | TBD | PyAV hwaccel=cuda |
 
 ## How rows are captured
@@ -77,5 +82,47 @@ Phase 3 split the swap+paste fused call into separate GPU-swap and CPU-paste sta
 **Decision:** Phase 3 reverted to commit `2b9b4e7` (Phase 2 done). Branch keeps Phase 1 (instrumentation) and Phase 2 (NVENC). Phase 4 (face batching) is small leverage (~1–2 fps) and doesn't compound with Phase 5; deferred indefinitely. Next step: Phase 5 multiprocessing fan-out, targeting **30–50 fps** at 1080p on this i9 + 4090 box.
 
 The `_paste_back` helper from Phase 3.2 was byte-equal to insightface's fused version (validated by the implementer on a real 1080p frame, zero non-zero diff pixels). If Phase 5 ends up wanting a standalone paste-back function inside each worker, this helper can be cherry-picked from the reflog (`git reflog show perf-flask-gpu-saturation` → commit `c0fe476`).
+
+## Phase 5 autoresearch — concurrency sweep + final winning config
+
+**Hardware:** Core i9 + RTX 4090 Laptop (16 GB VRAM).
+
+| Config | fps | scaling vs Phase 2 | VRAM | GPU SM util | Notes |
+|---|---|---|---|---|---|
+| Phase 2 baseline N=1 (clip_20s) | 4.1 | 1.0× | ~3 GB | ~30% | swap+paste fused in main thread |
+| N=2 (clip_20s) | 6.5 | 1.6× | 4.9 GB | 16-48% | |
+| N=4 (clip_20s) | 9.8 | 2.4× | 8.0 GB | 55-81% | |
+| **N=6** (clip_20s) | **11.3** | **2.7×** | 11.0 GB | 32-84% | stable peak on the 20s clip |
+| N=8 (clip_20s) | crash | — | — | — | `protobuf DecodeError` during `onnx.load` race; 1s stagger insufficient. Needs `multiprocessing.Lock` around model load. |
+| N=6 + det_size=480 (clip_20s) | 11.8 | 2.9× | 10.5 GB | 2-17% sampled | det_size only +5% at 1080p; swap dominates, not detect |
+| **N=6 + det_size=480 on FULL 5-min song** | **33.0** ⭐ | **8.0×** | 10.5 GB | **87-95%** | The headline number. Warmup amortised; pipeline at steady state; GPU genuinely saturated. |
+
+**The 20s smoke clip is misleading because the 32s worker warmup dominates the average.** On real-length content (7902 frames), the pipeline reaches steady state and the proc_fps jumps from 11.3 → 33.0. Wall-clock 290 s for 316 s of footage — i.e. **swap is now faster than playback**.
+
+### Why N=6 + det_size=480 is the winning config
+
+- N=6 saturates the GPU (samples in 87-95% range). Adding more workers can't extract more throughput because the GPU is the limiter.
+- N=8 hits a model-load race condition on Windows (protobuf decode failure when 8 workers `onnx.load` simultaneously). Fixable with a proper `multiprocessing.Lock` around the load, but won't materially help because the GPU is already maxed at N=6.
+- det_size=480 buys only +5% at 1080p because the swap stage (fused inswapper + 1080p paste-back) is the dominant cost per worker — detect is already small relative to it. Detect being smaller frees a sliver of GPU time, hence the +5%.
+- VRAM at this config: 10.5 GB on a 16 GB card. Plenty of headroom for higher resolutions or a 7th worker if a future fix unlocks it.
+
+### Knobs that did NOT pay off
+
+- **NVENC output (Phase 2)**: writer was never the bottleneck; pure CPU offload win that doesn't move proc_fps.
+- **Split paste-back into own thread (Phase 3)**: regressed throughput from 4.4 → 3.5 fps in single-process Python (GIL contention + extra queue overhead). REVERTED. Inside multiprocessing workers the **fused** swap+paste is optimal.
+- **Face batching (Phase 4)**: deferred — doesn't compound with multiprocessing; per-worker fused call is already optimal at typical 1-2 faces/frame.
+
+### Recommended production config
+
+```powershell
+$env:FACESWAP_PORT = "8082"
+$env:FACESWAP_WORKERS = "6"
+$env:FACESWAP_DET_SIZE = "480"
+$env:FACESWAP_VIDEO_ENCODER = "h264_nvenc"
+conda run -n dlc python webapp.py
+```
+
+For 24 GB desktop 4090: try `FACESWAP_WORKERS=8` after landing the model-load lock fix; should hit 40-50 fps.
+
 
 
