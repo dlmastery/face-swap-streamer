@@ -266,40 +266,93 @@ def worker_main(
               f"(providers={active})", flush=True)
 
         # Unpickle reference embeddings + source faces (master computed these once).
-        ref_embs = pickle.loads(ref_embs_bytes)               # (S, D) ndarray
-        ref_sources = pickle.loads(ref_sources_pickled)       # list of SourceSpec-likes
-        _ = ref_embs, ref_sources, fa, sw, ref_thresh         # silence "unused" in 5.1
+        # ref_embs: (S, D) float32 normed embeddings, one row per source.
+        # ref_sources: list[dict] with key 'src_face' holding the source-image Face
+        #              that inswapper will read identity from. We pass dicts (not the
+        #              SourceSpec dataclass) so this module has no webapp dependency.
+        ref_embs = pickle.loads(ref_embs_bytes)
+        ref_sources = pickle.loads(ref_sources_pickled)
+        ref_embs_T = ref_embs.T  # (D, S) — pre-transpose for the per-frame matmul
 
-        # Attach shared-memory slots — sub-task 5.2 wires these into per-frame use.
-        # For 5.1 we just resolve them once at startup and validate the names.
+        # Attach the shared-memory slots and build per-slot numpy views ONCE.
+        # Per-frame we just index into `slot_views[slot_id]`; no slicing or
+        # SharedMemory lookup in the hot loop.
         from multiprocessing import shared_memory
         slots = []
+        slot_views = []
         for name in shm_names:
             try:
-                slots.append(shared_memory.SharedMemory(name=name))
+                shm = shared_memory.SharedMemory(name=name)
             except FileNotFoundError as e:
                 raise RuntimeError(
                     f"[worker-{worker_id}] shared memory '{name}' not found: {e}"
                 ) from None
-        _ = shape, slots
+            slots.append(shm)
+            slot_views.append(np.ndarray(shape, dtype=np.uint8, buffer=shm.buf))
 
-        # ---- Main loop (sub-task 5.1: end-of-stream-only stub) -----------------
-        # Sub-task 5.3 replaces this body with: decode slot -> fa.get -> match -> sw.get
-        # -> write back into slot -> SwapResponse(frame_idx, slot_id, n_swapped).
+        # Tell master we're ready (frame_idx=-2 is the startup-ack convention).
+        out_q.put(SwapResponse(frame_idx=-2, worker_id=worker_id))
+
+        # ---- Main per-frame loop -----------------------------------------------
+        # In-process pipeline is intentionally single-threaded: every per-frame
+        # step (decode-from-shm, detect, match, fused swap+paste, encode-to-shm)
+        # is GIL-serialised against itself anyway, and parallelism comes from
+        # running N of these processes in parallel. Adding threads here just
+        # brings back the GIL contention we measured in Phase 3.
         while True:
             req: SwapRequest = in_q.get()
             if req.end:
                 out_q.put(SwapResponse(frame_idx=-1, worker_id=worker_id))
                 break
-            # Stub: not yet processing frames — should not happen in 5.1.
-            out_q.put(SwapResponse(
-                frame_idx=req.frame_idx,
-                slot_id=req.slot_id,
-                worker_id=worker_id,
-                error="worker_main stub — sub-task 5.3 not wired yet",
-            ))
 
-        # Release the shared-memory handles cleanly.
+            tA = time.perf_counter()
+            slot_id = int(req.slot_id)
+            frame_idx = int(req.frame_idx)
+            try:
+                # In-place numpy view of the slot; master already wrote the input
+                # BGR frame here. We mutate it in place with the swap result.
+                frame = slot_views[slot_id]
+
+                # Detect + match against the pre-stacked source references.
+                tgt_faces = fa.get(frame)
+                n_swapped = 0
+                if tgt_faces:
+                    tgt_embs = np.stack([f.normed_embedding for f in tgt_faces])
+                    sims = tgt_embs @ ref_embs_T          # (T, S)
+                    for ti, tface in enumerate(tgt_faces):
+                        si = int(np.argmax(sims[ti]))
+                        if float(sims[ti, si]) >= ref_thresh:
+                            # Fused swap+paste — same call shape as the
+                            # in-process Phase 2 path; matches its output byte-for-byte
+                            # (same model, same source face, same target face).
+                            swapped = sw.get(frame, tface,
+                                             ref_sources[si]["src_face"],
+                                             paste_back=True)
+                            # insightface returns a NEW ndarray for the swapped frame
+                            # (not in-place). Copy it back into the shared-memory slot
+                            # so the master sees the result without an extra IPC payload.
+                            frame[...] = swapped
+                            n_swapped += 1
+
+                elapsed = (time.perf_counter() - tA) * 1000.0
+                out_q.put(SwapResponse(
+                    frame_idx=frame_idx, slot_id=slot_id,
+                    n_swapped=n_swapped, worker_id=worker_id,
+                    elapsed_ms=elapsed,
+                ))
+            except Exception as e:
+                # Per-frame failure shouldn't kill the worker — report and continue.
+                # Master decides whether a single-frame error is fatal.
+                tb = traceback.format_exc()
+                print(f"[worker-{worker_id}] frame {frame_idx} error: {e}\n{tb}",
+                      flush=True)
+                out_q.put(SwapResponse(
+                    frame_idx=frame_idx, slot_id=slot_id,
+                    worker_id=worker_id,
+                    error=f"{type(e).__name__}: {e}",
+                ))
+
+        # Release the shared-memory handles cleanly (master owns + unlinks).
         for s in slots:
             try:
                 s.close()

@@ -13,9 +13,11 @@ import sys
 import glob
 import time
 import uuid
+import pickle
 import threading
 import queue
 import subprocess
+import multiprocessing as mp
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Optional
@@ -432,149 +434,347 @@ def _run_job(job: Job):
         ref_embs = np.stack([s.ref_emb for s in job.sources])  # shape (S, D)
         ref_sources = list(job.sources)                        # parallel index
 
-        # ---- 4-stage pipeline: reader -> detector -> swapper -> writer --------
-        # Each stage runs in its own thread, hand-off via bounded queues. This
-        # lets detection of frame N+1 overlap with the swap of frame N (GPU is
-        # serialised by ORT but CPU-side prep + paste_back can overlap), and
-        # lets cv2 decode + ffmpeg pipe writes happen entirely off the GPU
-        # critical path.
+        # ---- Phase 5: multiprocess swap-worker fan-out --------------------------
+        # Replaces the in-process 4-thread pipeline that hit the GIL ceiling in
+        # Phase 3. N worker processes each load their own buffalo_l +
+        # inswapper (~30-60s × N, paid once per job in parallel since spawn
+        # gives each worker its own Python interpreter), then steady-state
+        # the master demuxes frames into shared-memory slots, workers race
+        # to claim and process, master reorders by frame_idx and writes to
+        # ffmpeg.
         #
-        # Q_DEPTH=128 → ~1.6 GB at 1080p across all three queues. With this
-        # much slack the reader runs ~5-10 sec ahead of the swap loop, so
-        # transient I/O hiccups (ffmpeg flushing an HLS segment, page-cache
-        # writes) never starve the GPU.
-        Q_DEPTH = 128
-        END = object()
-        read_q: "queue.Queue[object]"   = queue.Queue(maxsize=Q_DEPTH)
-        detect_q: "queue.Queue[object]" = queue.Queue(maxsize=Q_DEPTH)
-        write_q: "queue.Queue[object]"  = queue.Queue(maxsize=Q_DEPTH)
-        broken = False
+        # Single shared in_q + single shared out_q is naturally load-balancing
+        # and matches the multiprocessing.Queue safe-many-consumers pattern.
+        # No per-worker queues = no head-of-line blocking from a slow worker.
+        from server.swap_worker import worker_main, SwapRequest, SwapResponse, FramePool
 
-        # Per-stage rolling timers (p50/p95/max over the last 250 frames).
-        # Surfaced in /status JSON for live perf inspection; the cost of
-        # record() is a deque append under a Lock — ~1-2 us, well below
-        # the per-frame budget of every stage.
+        n_workers = max(1, int(os.getenv("FACESWAP_WORKERS", "4")))
+        # Slots-per-worker controls how far the master can run ahead of the
+        # slowest worker. 4× gives ~16 slots at N=4 — ~100 MB shared RAM
+        # at 1080p — and tolerates one stalled worker without starving the
+        # rest. Tunable; keep it small enough that reorder-buffer can't grow
+        # unbounded (master also caps it explicitly below).
+        slots_per_worker = max(2, int(os.getenv("FACESWAP_SLOTS_PER_WORKER", "4")))
+        n_slots = n_workers * slots_per_worker
+
+        # Spawn-start on every platform: fork+CUDA is unsafe even on Linux,
+        # and Windows is spawn-only anyway. set_start_method is one-shot per
+        # interpreter; tolerate repeated calls within the same process.
+        try:
+            mp.set_start_method("spawn", force=False)
+        except RuntimeError:
+            pass  # already set in this interpreter — fine
+
+        # Per-stage rolling timers. The "swap" timer no longer reflects the
+        # whole per-frame swap-stage wall time (workers parallelise that);
+        # we replace it with worker_total = master-side time from dispatch
+        # to result_collected. That number is what end-to-end latency looks
+        # like to the master.
         timers = {
-            "read":   StageTimer("read"),
-            "detect": StageTimer("detect"),
-            "swap":   StageTimer("swap"),    # swap+paste fused (insightface sw.get does both)
-            "write":  StageTimer("write"),
+            "read":          StageTimer("read"),
+            "dispatch":      StageTimer("dispatch"),
+            "worker_total":  StageTimer("worker_total"),
+            "write":         StageTimer("write"),
         }
         job.timers = timers
 
-        def _reader_loop():
-            try:
-                while not job.stop_flag.is_set():
-                    t = time.perf_counter()
-                    ok, fr = cap.read()
-                    timers["read"].record((time.perf_counter() - t) * 1000)
-                    if not ok:
-                        break
-                    read_q.put(fr)
-            finally:
-                read_q.put(END)
+        # Pickle reference embeddings and per-source src_face for the workers.
+        # SourceSpec is a dataclass; we hand the worker just the bits it needs
+        # (its module has no webapp dependency).
+        ref_sources_for_workers = [
+            {"src_face": s.src_face, "gender": s.gender}
+            for s in job.sources
+        ]
+        ref_embs_bytes = pickle.dumps(ref_embs)
+        ref_sources_pickled = pickle.dumps(ref_sources_for_workers)
 
-        def _detect_loop():
-            """Detect faces + embedding-match against the source pool. Emits
-            (frame, list_of_(face, source_index)) tuples to the swap stage."""
-            try:
-                while True:
-                    item = read_q.get()
-                    if item is END:
-                        return
-                    frame = item
-                    t = time.perf_counter()
-                    tgt_faces = fa.get(frame)
-                    picks = []
-                    if tgt_faces:
-                        tgt_embs = np.stack([f.normed_embedding for f in tgt_faces])
-                        sims = tgt_embs @ ref_embs.T          # (T, S)
-                        for ti, tface in enumerate(tgt_faces):
-                            si = int(np.argmax(sims[ti]))
-                            if float(sims[ti, si]) >= REFERENCE_THRESH:
-                                picks.append((tface, si))
-                    timers["detect"].record((time.perf_counter() - t) * 1000)
-                    detect_q.put((frame, picks))
-            finally:
-                detect_q.put(END)
-
-        def _writer_loop():
-            nonlocal broken
-            while True:
-                item = write_q.get()
-                if item is END:
-                    return
-                try:
-                    t = time.perf_counter()
-                    ffmpeg.stdin.write(item)
-                    timers["write"].record((time.perf_counter() - t) * 1000)
-                except (BrokenPipeError, OSError):
-                    broken = True
-                    while True:
-                        x = write_q.get()
-                        if x is END:
-                            return
-
-        t_reader = threading.Thread(target=_reader_loop, daemon=True,
-                                    name=f"job-{job.id}-reader")
-        t_detect = threading.Thread(target=_detect_loop, daemon=True,
-                                    name=f"job-{job.id}-detect")
-        t_writer = threading.Thread(target=_writer_loop, daemon=True,
-                                    name=f"job-{job.id}-writer")
-        t_reader.start()
-        t_detect.start()
-        t_writer.start()
-
-        n = 0
-        swap_count = 0
-        t0 = time.time()
-        last_log = t0
+        # Shared frame pool sized at the SOURCE video resolution.
+        # Init names BEFORE the try-block so the finally can always clean up.
+        pool: Optional["FramePool"] = None
+        in_q = None
+        out_q = None
+        workers: list = []
         try:
-            while True:
-                if job.stop_flag.is_set():
-                    raise RuntimeError("cancelled")
-                if broken:
-                    break
-                item = detect_q.get()
-                if item is END:
-                    break
-                frame, picks = item
-                n += 1
-                t = time.perf_counter()
-                for tface, si in picks:
-                    frame = sw.get(frame, tface, ref_sources[si].src_face,
-                                   paste_back=True)
-                    swap_count += 1
-                timers["swap"].record((time.perf_counter() - t) * 1000)
+            pool = FramePool(n_slots=n_slots, shape=(in_h, in_w, 3))
+            shm_names = pool.names
 
-                if broken:
-                    break
-                write_q.put(frame.tobytes())
+            in_q  = mp.Queue(maxsize=n_slots)        # SwapRequest (single shared)
+            out_q = mp.Queue()                       # SwapResponse (single shared)
 
-                now = time.time()
-                if now - last_log > 0.5:
-                    elapsed = now - t0
-                    job.current_frame = n
-                    job.swap_count = swap_count
-                    job.proc_fps = n / elapsed if elapsed else 0.0
-                    last_log = now
-        finally:
-            # Tell the reader to stop on its next iteration. The reader puts
-            # END into read_q on exit; the detector then forwards END into
-            # detect_q; the main loop sees END and breaks. We additionally
-            # drain any pending items so blocked put()s don't deadlock the
-            # join. Writer gets its own END from us here.
-            job.stop_flag.set()
-            for q_ in (read_q, detect_q):
+            det_size   = int(os.getenv("FACESWAP_DET_SIZE", "640"))
+            det_thresh = float(os.getenv("FACESWAP_DET_THRESH", "0.3"))
+            face_model = os.getenv("FACESWAP_FACE_MODEL", "buffalo_l")
+
+            warm_t0 = time.perf_counter()
+            for wid in range(n_workers):
+                p = mp.Process(
+                    target=worker_main,
+                    args=(
+                        wid, in_q, out_q, shm_names, (in_h, in_w, 3),
+                        ref_embs_bytes, ref_sources_pickled,
+                        det_size, det_thresh, REFERENCE_THRESH,
+                        face_model, SWAPPER_PATH,
+                    ),
+                    name=f"swap-worker-{wid}",
+                    daemon=False,   # keep alive across the job; we join() explicitly
+                )
+                p.start()
+                workers.append(p)
+            print(f"[webapp] spawned {n_workers} worker(s) "
+                  f"(pid={[p.pid for p in workers]}), waiting for model load...",
+                  flush=True)
+
+            # Wait for each worker's startup ack (frame_idx=-2). Each worker takes
+            # ~30-60 s on first run (TRT cache absent) or ~5-15 s warm. We time
+            # out at 5 min per worker — if any worker hasn't acked by then,
+            # something's badly wrong (cuDNN missing, GPU full, etc.).
+            ready = set()
+            startup_deadline = time.time() + (300.0 * n_workers)
+            while len(ready) < n_workers:
                 try:
-                    while True:
-                        q_.get_nowait()
-                except queue.Empty:
-                    pass
-            write_q.put(END)
-            t_writer.join(timeout=30)
-            t_detect.join(timeout=10)
-            t_reader.join(timeout=10)
+                    resp: SwapResponse = out_q.get(timeout=10.0)
+                except Exception:
+                    # Liveness check while waiting: any worker died?
+                    for p in workers:
+                        if not p.is_alive() and p.exitcode != 0:
+                            raise RuntimeError(
+                                f"worker {p.name} died during startup "
+                                f"(exitcode={p.exitcode}) — check stderr/cuDNN"
+                            )
+                    if time.time() > startup_deadline:
+                        raise RuntimeError(
+                            f"only {len(ready)}/{n_workers} workers ready after "
+                            f"{n_workers * 300}s — likely a stuck model load"
+                        )
+                    continue
+                if resp.frame_idx == -2:
+                    ready.add(resp.worker_id)
+                    print(f"[webapp]   worker {resp.worker_id} ready "
+                          f"({len(ready)}/{n_workers})", flush=True)
+                elif resp.error:
+                    raise RuntimeError(
+                        f"worker {resp.worker_id} startup failed: {resp.error}"
+                    )
+            warm_ms = (time.perf_counter() - warm_t0) * 1000.0
+            print(f"[webapp] all {n_workers} workers warm in {warm_ms:.0f} ms", flush=True)
+
+            # ---- Master-side state --------------------------------------------
+            # done[frame_idx] -> (slot_id, n_swapped) — out-of-order completions
+            # queued here; the writer thread drains in order.
+            # dispatch_ts[frame_idx] -> perf_counter timestamp for worker_total timing.
+            done: dict = {}
+            dispatch_ts: dict = {}
+            done_lock = threading.Lock()
+            all_dispatched = threading.Event()  # set when demux thread has sent all frames
+            broken = False
+            worker_error: list = []             # collects fatal errors from out_q drainer
+            n = [0]                             # current_frame (boxed for closure mutation)
+            swap_count = [0]
+            t0 = time.time()
+            # Cap the reorder buffer so a single stalled worker can't pin all slots.
+            # 4× n_workers is the spec cap; if we hit it, log loudly — the master
+            # will still recover once the slow worker finishes its in-flight frame.
+            reorder_cap = max(n_workers * 4, 16)
+
+            def _drainer_loop():
+                """Pull SwapResponse from out_q -> stash in `done` keyed by frame_idx.
+                Runs until reader-thread has dispatched all frames AND all frames
+                have been collected (n_dispatched == n_collected). Errors are
+                forwarded to the master via `worker_error`."""
+                collected = 0
+                while True:
+                    try:
+                        resp: SwapResponse = out_q.get(timeout=1.0)
+                    except Exception:
+                        # Liveness check: any worker died with non-zero exitcode?
+                        for p in workers:
+                            if not p.is_alive() and p.exitcode not in (0, None):
+                                worker_error.append(
+                                    f"worker {p.name} died (exitcode={p.exitcode})"
+                                )
+                                return
+                        if all_dispatched.is_set():
+                            with done_lock:
+                                outstanding = len(dispatch_ts) - collected
+                            if outstanding <= 0:
+                                return
+                        continue
+                    if resp.error:
+                        worker_error.append(
+                            f"worker {resp.worker_id} frame {resp.frame_idx}: {resp.error}"
+                        )
+                        return
+                    if resp.frame_idx == -1:
+                        # end-of-stream ack — not used during streaming (only at shutdown)
+                        continue
+                    t_done = time.perf_counter()
+                    with done_lock:
+                        t_disp = dispatch_ts.get(resp.frame_idx)
+                        if t_disp is not None:
+                            timers["worker_total"].record((t_done - t_disp) * 1000.0)
+                        done[resp.frame_idx] = (resp.slot_id, resp.n_swapped)
+                    collected += 1
+
+            def _demux_loop():
+                """Read frames from cv2, copy into a shared-mem slot, dispatch to
+                workers via in_q. Bounded backpressure: pool.acquire() blocks when
+                all slots are in flight, but with a short timeout so we re-check
+                worker_error / stop_flag (otherwise a fully-crashed worker pool
+                would deadlock demux forever holding all slots). END-of-stream
+                just exits the loop; the writer thread observes all_dispatched
+                + done length to know when to finish."""
+                frame_idx = 0
+                try:
+                    while not job.stop_flag.is_set() and not broken and not worker_error:
+                        t = time.perf_counter()
+                        ok, fr = cap.read()
+                        timers["read"].record((time.perf_counter() - t) * 1000)
+                        if not ok:
+                            break
+                        # Acquire a slot with a short timeout so all-workers-dead
+                        # doesn't deadlock us (master watcher catches the death
+                        # and clears worker_error; we exit on the next iter).
+                        slot_id = None
+                        while slot_id is None:
+                            if job.stop_flag.is_set() or worker_error:
+                                return
+                            try:
+                                slot_id = pool.acquire(timeout=1.0)
+                            except queue.Empty:
+                                continue
+                        # Copy decoded frame into shared memory. .copy()-equivalent is
+                        # implicit in the [...] assignment; this is the single
+                        # CPU-side memcpy per frame we currently pay.
+                        pool.view(slot_id)[:] = fr
+                        t_disp = time.perf_counter()
+                        with done_lock:
+                            dispatch_ts[frame_idx] = t_disp
+                        in_q.put(SwapRequest(frame_idx=frame_idx, slot_id=slot_id))
+                        timers["dispatch"].record((time.perf_counter() - t_disp) * 1000)
+                        frame_idx += 1
+                finally:
+                    all_dispatched.set()
+
+            def _writer_loop():
+                """In-order writer: drain `done` in ascending frame_idx, write to
+                ffmpeg, recycle slot. Exits when next_to_write reaches frame_idx
+                of last-dispatched (after all_dispatched is set)."""
+                nonlocal broken
+                next_to_write = 0
+                last_log = time.time()
+                last_rb_warn = 0.0
+                while True:
+                    if worker_error or job.stop_flag.is_set():
+                        return
+                    with done_lock:
+                        entry = done.pop(next_to_write, None)
+                        rb_len = len(done)
+                    if entry is None:
+                        if all_dispatched.is_set():
+                            with done_lock:
+                                if next_to_write >= len(dispatch_ts):
+                                    return  # all frames written
+                        if rb_len > reorder_cap:
+                            # Diagnostic only; we don't drop — we just warn that one
+                            # worker has fallen far behind. Master still progresses
+                            # as soon as the slow frame lands. Rate-limited so it
+                            # doesn't spam the log every poll iteration.
+                            now_w = time.time()
+                            if now_w - last_rb_warn > 5.0:
+                                print(f"[webapp] reorder buffer {rb_len} > cap "
+                                      f"{reorder_cap} (next_to_write={next_to_write}) "
+                                      f"— slow worker?", flush=True)
+                                last_rb_warn = now_w
+                        time.sleep(0.001)  # short spin — out_q drainer wakes us
+                        continue
+                    slot_id, n_swapped = entry
+                    arr = pool.view(slot_id)
+                    try:
+                        t = time.perf_counter()
+                        # arr.tobytes() copies the contiguous uint8 view. Same cost
+                        # as the old frame.tobytes() per-frame memcpy.
+                        ffmpeg.stdin.write(arr.tobytes())
+                        timers["write"].record((time.perf_counter() - t) * 1000)
+                    except (BrokenPipeError, OSError):
+                        broken = True
+                        pool.release(slot_id)
+                        return
+                    pool.release(slot_id)
+                    n[0] = next_to_write + 1
+                    swap_count[0] += n_swapped
+                    next_to_write += 1
+
+                    now = time.time()
+                    if now - last_log > 0.5:
+                        elapsed = now - t0
+                        job.current_frame = n[0]
+                        job.swap_count = swap_count[0]
+                        job.proc_fps = n[0] / elapsed if elapsed else 0.0
+                        last_log = now
+
+            t_drain  = threading.Thread(target=_drainer_loop, daemon=True,
+                                        name=f"job-{job.id}-drain")
+            t_demux  = threading.Thread(target=_demux_loop,   daemon=True,
+                                        name=f"job-{job.id}-demux")
+            t_writer = threading.Thread(target=_writer_loop,  daemon=True,
+                                        name=f"job-{job.id}-writer")
+            t_drain.start()
+            t_demux.start()
+            t_writer.start()
+
+            # Block this thread until the writer finishes OR a worker dies.
+            # 30 min hard cap — if a 1080p source takes longer than that
+            # we have a stall.
+            deadline = time.time() + 30 * 60
+            while t_writer.is_alive():
+                if time.time() > deadline:
+                    raise RuntimeError("streaming exceeded 30 min wall-clock — stalled?")
+                if worker_error:
+                    raise RuntimeError("; ".join(worker_error))
+                # Liveness check: any worker died mid-stream?
+                for p in workers:
+                    if not p.is_alive() and p.exitcode not in (0, None):
+                        raise RuntimeError(
+                            f"worker {p.name} died mid-stream "
+                            f"(exitcode={p.exitcode}) — check worker stderr"
+                        )
+                t_writer.join(timeout=2.0)
+            t_demux.join(timeout=10)
+            t_drain.join(timeout=30)
+
+            # Unbox into plain ints for the final-stats line below (closures
+            # are joined; no risk of confusing them with the rebinding).
+            final_n = int(n[0])
+            final_swap_count = int(swap_count[0])
+            n = final_n
+            swap_count = final_swap_count
+        finally:
+            # Always tear down the worker pool, even on cancel/exception.
+            # 1) Tell every worker to exit (end-of-stream marker).
+            if in_q is not None:
+                for _ in workers:
+                    try:
+                        in_q.put(SwapRequest(end=True), timeout=5.0)
+                    except Exception:
+                        pass
+            for p in workers:
+                if p.is_alive():
+                    p.join(timeout=30)
+                if p.is_alive():
+                    print(f"[webapp] worker {p.name} did not exit in 30s — terminating",
+                          flush=True)
+                    p.terminate()
+                    p.join(timeout=5)
+            # 2) Close queues, dropping any buffered messages.
+            for q_ in (in_q, out_q):
+                if q_ is not None:
+                    try:
+                        q_.close(); q_.join_thread()
+                    except Exception:
+                        pass
+            # 3) Release shared-memory slots and the source-video reader.
+            if pool is not None:
+                pool.close()
             cap.release()
         # close ffmpeg cleanly so it writes the HLS endlist + finalises MP4
         try:
