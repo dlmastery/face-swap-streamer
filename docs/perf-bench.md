@@ -8,7 +8,7 @@ Each row records the timer snapshot at the **end** of the swap stream (just befo
 |---|---|---|---|---|---|---|---|---|---|---|---|
 | 0 (baseline pre-perf branch) | TBD | — | — | — | — | — | ~30% | 0% (libx264) | 0% (sw decode) | TBD | swap+paste fused; cv2 software decode; libx264 |
 | 1 (timing instrumented) | **4.4** | 8.86 | 101.88 | 326.44 | n/a (fused) | 1.32 | not sampled mid-run | 0% | 0% | 313 | swap stage dominates at 1080p; detect+matmul bundle is ~100 ms; user's :8080 Flask was idle but loaded |
-| 2 (NVENC output) | TBD | TBD | TBD | TBD | n/a | TBD | TBD | >0% | TBD | TBD | h264_nvenc |
+| 2 (NVENC output) | 4.1 | 9.12 | 111.43 | 333.28 | n/a | 1.33 | 0–35% (swap-bound) | 0% sampled (idle waiting on swap) | 0% | 313 | h264_nvenc active per ffmpeg log; no proc_fps gain because writer wasn't bottleneck. Win is freed CPU for Phase 3 paste-back. |
 | 3 (paste-back split) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | 5-stage pipeline; paste in own thread |
 | 4 (face batching) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | batched ORT call when ≥2 faces/frame |
 | 5 (multiproc N=4) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | 4 worker processes via shared_memory |
