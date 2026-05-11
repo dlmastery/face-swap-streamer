@@ -11,7 +11,7 @@ Each row records the timer snapshot at the **end** of the swap stream (just befo
 | 2 (NVENC output) | 4.1 | 9.12 | 111.43 | 333.28 | n/a | 1.33 | 0–35% (swap-bound) | 0% sampled (idle waiting on swap) | 0% | 313 | h264_nvenc active per ffmpeg log; no proc_fps gain because writer wasn't bottleneck. Win is freed CPU for Phase 3 paste-back. |
 | ~~3 (paste-back split)~~ | **3.5 ❌ regression** | 14.51 | 120.06 | 19.37 | 259.27 | 4.28 | not sampled | n/a | n/a | 313 | **REVERTED.** Implemented + reviewed but throughput dropped vs Phase 2 (4.1 → 3.5). See note below. |
 | 4 (face batching) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | batched ORT call when ≥2 faces/frame |
-| 5 (multiproc N=4) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | 4 worker processes via shared_memory |
+| 5 (multiproc N=4) | TBD | TBD | n/a | n/a | n/a | TBD | TBD | TBD | TBD | TBD | 4 worker processes via shared_memory; "detect/swap/paste" replaced by per-worker `worker_total` (master-side dispatch -> result_collected). |
 | 6 (NVDEC input) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | >0% | TBD | PyAV hwaccel=cuda |
 
 ## How rows are captured
@@ -28,6 +28,29 @@ conda run -n dlc python webapp.py   # in worktree, foreground or background
 The Phase 1 row sets the baseline including instrumentation overhead. Subsequent rows must be strictly higher in `proc_fps` and within ±5% of `swap_count` (allowing for NMS/detector non-determinism) to advance.
 
 Visual quality is verified by spot-checking `webapp_jobs/<id>/swapped.mp4` after each phase — eyeball comparison against the Phase 1 output, looking for chin alignment, blend seams, and colour bleed.
+
+## Phase 5 timer schema (changed from Phases 1–3)
+
+The 4-thread pipeline of Phases 1–3 had `read / detect / swap / write`
+timers running in series across one process. Phase 5 replaces that with
+N worker processes, so per-frame "detect" and "swap" are no longer
+visible from the master — the master just sees dispatch-to-result.
+
+Master-side timers in Phase 5:
+
+| Name | What it measures |
+|---|---|
+| `read` | `cv2.VideoCapture.read()` wall time (decode of one frame) |
+| `dispatch` | shared-memory copy + `in_q.put(SwapRequest)` (master -> worker handoff) |
+| `worker_total` | `perf_counter` from dispatch to receiving `SwapResponse` (full per-frame round-trip incl. queue latency + detect + swap + paste in the worker). This is the end-to-end per-frame latency the master observes; it does NOT equal `proc_fps^-1` because workers process in parallel. |
+| `write` | `ffmpeg.stdin.write()` wall time (master -> ffmpeg piping) |
+
+`worker_total p50` is the key Phase 5 number: it should be in the
+same ballpark as the Phase 2 swap timer (~330 ms at 1080p) because
+each worker is doing the same fused swap+paste, but `proc_fps` should
+be roughly N × Phase 2 fps because N workers run in parallel.
+
+Status JSON additions: `n_workers`, `worker_warmup_ms`.
 
 ## Phase 1 takeaways (the smoke test that drives every subsequent phase)
 

@@ -108,6 +108,9 @@ class Job:
     finished: float = 0.0
     stop_flag: threading.Event = field(default_factory=threading.Event)
     timers: dict = field(default_factory=dict)   # name -> StageTimer; populated in _run_job
+    # ---- Phase 5 telemetry (multiprocess swap-worker fan-out) -------------
+    n_workers: int = 0           # number of swap-worker processes (== FACESWAP_WORKERS)
+    worker_warmup_ms: float = 0.0  # time spent waiting for all workers to load models
 
 
 class StageTimer:
@@ -556,6 +559,7 @@ def _run_job(job: Job):
                         f"worker {resp.worker_id} startup failed: {resp.error}"
                     )
             warm_ms = (time.perf_counter() - warm_t0) * 1000.0
+            _set(job, n_workers=n_workers, worker_warmup_ms=round(warm_ms, 1))
             print(f"[webapp] all {n_workers} workers warm in {warm_ms:.0f} ms", flush=True)
 
             # ---- Master-side state --------------------------------------------
@@ -1724,6 +1728,9 @@ def status(job_id: str):
         "proc_fps": job.proc_fps,
         "error": job.error,
         "timers": timers,
+        # Phase 5 telemetry
+        "n_workers": job.n_workers,
+        "worker_warmup_ms": job.worker_warmup_ms,
     })
 
 
