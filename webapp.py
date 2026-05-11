@@ -261,8 +261,20 @@ def _spawn_ffmpeg(job: Job, w: int, h: int, fps: float) -> subprocess.Popen:
         "-i", target_abs,
         # take video from input 0, audio (if any) from input 1
         "-map", "0:v:0", "-map", "1:a:0?",
-        "-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
-        "-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.1",
+    ]
+    # Video encoder: NVENC by default (dedicated GPU silicon, free CPU);
+    # FACESWAP_VIDEO_ENCODER=libx264 falls back to CPU x264 for parity tests.
+    encoder = os.getenv("FACESWAP_VIDEO_ENCODER", "h264_nvenc").lower()
+    if encoder == "h264_nvenc":
+        cmd += ["-c:v", "h264_nvenc",
+                "-preset", "p4",        # ~equivalent to libx264 veryfast in NVENC
+                "-rc", "vbr", "-cq", "21",
+                "-b:v", "0",            # let -cq drive bitrate
+                "-pix_fmt", "yuv420p", "-profile:v", "high"]
+    else:
+        cmd += ["-c:v", "libx264", "-preset", "ultrafast", "-tune", "zerolatency",
+                "-pix_fmt", "yuv420p", "-profile:v", "high", "-level", "4.1"]
+    cmd += [
         "-g", str(int(round(fps * 2))),
         "-keyint_min", str(int(round(fps * 2))),
         "-sc_threshold", "0",
