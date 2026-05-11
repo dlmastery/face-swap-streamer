@@ -1566,6 +1566,9 @@ if __name__ == "__main__":
     _cleanup_old_jobs()
     # Pre-warm models in a background thread so the first job is faster.
     threading.Thread(target=_ensure_models, daemon=True).start()
-    print("[webapp] starting on http://localhost:8080/  (jobs at " + JOBS_DIR + ")", flush=True)
+    # Port override so parallel smoke tests (worktrees, alt branches) can
+    # bind to a different port without fighting the canonical :8080 instance.
+    _port = int(os.environ.get("FACESWAP_PORT", "8080"))
+    print(f"[webapp] starting on http://localhost:{_port}/  (jobs at " + JOBS_DIR + ")", flush=True)
     # Threaded server so the long-poll MJPEG stream doesn't block other requests.
-    app.run(host="0.0.0.0", port=8080, threaded=True, debug=False, use_reloader=False)
+    app.run(host="0.0.0.0", port=_port, threaded=True, debug=False, use_reloader=False)
