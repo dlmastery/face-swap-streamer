@@ -1496,7 +1496,7 @@ def status(job_id: str):
         }
         for s in (job.sources or [])
     ]
-    timers = {k: v.snapshot() for k, v in (getattr(job, "timers", {}) or {}).items()}
+    timers = {k: v.snapshot() for k, v in job.timers.items()}
     return jsonify({
         "phase": job.phase,
         "message": job.message,
