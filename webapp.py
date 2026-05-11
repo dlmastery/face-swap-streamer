@@ -438,10 +438,24 @@ def _run_job(job: Job):
         write_q: "queue.Queue[object]"  = queue.Queue(maxsize=Q_DEPTH)
         broken = False
 
+        # Per-stage rolling timers (p50/p95/max over the last 250 frames).
+        # Surfaced in /status JSON for live perf inspection; the cost of
+        # record() is a deque append under a Lock — ~1-2 us, well below
+        # the per-frame budget of every stage.
+        timers = {
+            "read":   StageTimer("read"),
+            "detect": StageTimer("detect"),
+            "swap":   StageTimer("swap"),    # swap+paste fused (insightface sw.get does both)
+            "write":  StageTimer("write"),
+        }
+        job.timers = timers
+
         def _reader_loop():
             try:
                 while not job.stop_flag.is_set():
+                    t = time.perf_counter()
                     ok, fr = cap.read()
+                    timers["read"].record((time.perf_counter() - t) * 1000)
                     if not ok:
                         break
                     read_q.put(fr)
@@ -457,6 +471,7 @@ def _run_job(job: Job):
                     if item is END:
                         return
                     frame = item
+                    t = time.perf_counter()
                     tgt_faces = fa.get(frame)
                     picks = []
                     if tgt_faces:
@@ -466,6 +481,7 @@ def _run_job(job: Job):
                             si = int(np.argmax(sims[ti]))
                             if float(sims[ti, si]) >= REFERENCE_THRESH:
                                 picks.append((tface, si))
+                    timers["detect"].record((time.perf_counter() - t) * 1000)
                     detect_q.put((frame, picks))
             finally:
                 detect_q.put(END)
@@ -477,7 +493,9 @@ def _run_job(job: Job):
                 if item is END:
                     return
                 try:
+                    t = time.perf_counter()
                     ffmpeg.stdin.write(item)
+                    timers["write"].record((time.perf_counter() - t) * 1000)
                 except (BrokenPipeError, OSError):
                     broken = True
                     while True:
@@ -510,10 +528,12 @@ def _run_job(job: Job):
                     break
                 frame, picks = item
                 n += 1
+                t = time.perf_counter()
                 for tface, si in picks:
                     frame = sw.get(frame, tface, ref_sources[si].src_face,
                                    paste_back=True)
                     swap_count += 1
+                timers["swap"].record((time.perf_counter() - t) * 1000)
 
                 if broken:
                     break
