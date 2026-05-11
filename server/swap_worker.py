@@ -241,6 +241,15 @@ def worker_main(
         face_model = models_face_dir or "buffalo_l"
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
 
+        # Stagger model-file reads across workers. When N>=6 workers all run
+        # onnx.load() on the same .onnx file simultaneously on Windows, the
+        # protobuf parser intermittently fails with `DecodeError: Error parsing
+        # message` — Windows-level concurrent-read returns a partial buffer to
+        # one of the racers. Sleep ~1s per worker_id before opening any models
+        # to serialise the load path. Costs `(N-1) × 1s` to first-frame at
+        # job start; not in the steady-state hot loop.
+        time.sleep(worker_id * 1.0)
+
         print(f"[worker-{worker_id}] loading FaceAnalysis({face_model}) "
               f"det_size={det_size} det_thresh={det_thresh}...", flush=True)
         fa = FaceAnalysis(name=face_model, providers=providers)
