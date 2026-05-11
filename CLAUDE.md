@@ -159,7 +159,8 @@ Several independent paths share the repo:
 | **A** | FaceFusion 3.6 | Highest-quality offline render via CLI |
 | **B** | Deep-Live-Cam 2.1.2 | Real-time GUI swap (webcam / virtual camera) |
 | **C** | OBS Studio | Loop a swapped MP4 into a virtual webcam |
-| **★** | **`webapp.py`** (Flask :8080) | **Original web app — most documented path** |
+| **★** | **`webapp.py`** (Flask :8080) | **Original web app** — single-process 4-stage thread pipeline. 4-8 fps at 1080p. Most documented path. |
+| **★★★** | **`webapp_mp.py`** (Flask any port, defaults :8080) | **Multiprocessing variant** — N worker processes via `multiprocessing.shared_memory`. **33 fps steady-state at 1080p** on i9 + 4090 with N=6. Same UI, same models, same outputs as `webapp.py`. Set `FACESWAP_PORT=8082 FACESWAP_WORKERS=6 FACESWAP_DET_SIZE=480` for the peak config. |
 | **★★** | **FastAPI :8081 + Next.js :3000** (`server/`, `web/`) | **Production-grade rewrite** with batch upload + WebSocket status + ZIP download |
 | **CLI** | **`cli/faceswap.exe`** | **C++ port** of the swap pipeline for batch / headless use, no Python required |
 
@@ -225,7 +226,9 @@ env.
 
 | File | Purpose |
 |---|---|
-| `webapp.py` | Flask app — the main artefact. ~700 lines: dataclass `Job`, model loader, worker `_run_job`, `_spawn_ffmpeg`, Flask routes, two big HTML templates (`INDEX_HTML`, `VIEWER_HTML`) |
+| `webapp.py` | Flask app — the **original** single-process artefact. ~700 lines: dataclass `Job`, model loader, worker `_run_job`, `_spawn_ffmpeg`, Flask routes, two big HTML templates (`INDEX_HTML`, `VIEWER_HTML`). 4-8 fps at 1080p. Stable, simple, no extra dependencies. |
+| `webapp_mp.py` | Flask app — **multiprocessing variant**. Same routes / HTML / API as `webapp.py` but `_run_job` spawns N worker processes (`server/swap_worker.py`) that share frames via `multiprocessing.shared_memory`. Same models, same outputs. Adds `n_workers` + `worker_warmup_ms` + `paste` to `/status` JSON. **33 fps at 1080p steady-state** with `FACESWAP_WORKERS=6 FACESWAP_DET_SIZE=480` on RTX 4090 + i9. See `docs/perf-bench.md` for the autoresearch + winning config. |
+| `server/swap_worker.py` | Per-worker entry point for `webapp_mp.py`. Loads `FaceAnalysis` + `INSwapper` once at process start, then loops on `SwapRequest`/`SwapResponse` over `multiprocessing.Queue`. Uses `FramePool` (shared-memory ring) to avoid IPC frame copies. ~310 lines. Reused inside each spawned worker via `mp.Process(target=worker_main, ...)`. |
 | `stream-swap.py` | CLI version of the streaming pipeline. Outputs to `ffplay` window or a tiny built-in MJPEG http server. Useful for debugging the swap loop without Flask in the way |
 | `extract-ref.py` | Standalone helper: scan a video, return the clearest face of a given gender |
 | `probe.py` | Compatibility check on an `(image, video)` pair — reports if both are readable and a face is detectable in each |
@@ -252,9 +255,25 @@ env.
 ## Common tasks (commands you'll use)
 
 ### Run the webapp (foreground)
+
+Single-process / 4-thread pipeline (the original — 4-8 fps at 1080p):
 ```powershell
 conda run -n dlc python webapp.py
 ```
+
+Multiprocessing variant (33 fps steady-state at 1080p — see `docs/perf-bench.md`):
+```powershell
+$env:FACESWAP_PORT       = "8082"   # avoid colliding with webapp.py if both running
+$env:FACESWAP_WORKERS    = "6"      # N worker processes (default 4; 8 OOMs/race on 16 GB cards)
+$env:FACESWAP_DET_SIZE   = "480"    # smaller detector → frees GPU for swap (+5%)
+$env:FACESWAP_VIDEO_ENCODER = "h264_nvenc"   # NVENC keeps the encoder off the CPU
+conda run -n dlc python webapp_mp.py
+```
+
+Both expose the same UI / HTML / `/status` JSON. Differences:
+- `webapp_mp.py` spawns N workers at *job* start, which adds ~30 s of warmup to the first frame. Subsequent jobs in the same Flask process re-pay the warmup (no warm-pool yet).
+- `webapp_mp.py`'s `/status` JSON adds `n_workers`, `worker_warmup_ms`, and a `paste` timer; otherwise identical schema.
+- Pick `webapp.py` if you want the simpler "one job at a time, fewer moving parts" path. Pick `webapp_mp.py` if you want max throughput (4090 + i9 hits ~33 fps).
 
 ### Run in background, capture log
 ```powershell

@@ -5,6 +5,107 @@ introduced them and the lessons each one taught.
 
 ---
 
+## v0.11 — Multiprocessing webapp variant (33 fps at 1080p)
+
+**`webapp_mp.py`** and **`server/swap_worker.py`** — new files. Original
+`webapp.py` kept unchanged so both runtimes ship side-by-side.
+
+### What it is
+
+A drop-in companion to `webapp.py` that replaces the in-process 4-thread
+pipeline with N worker processes coordinated via `multiprocessing.shared_memory`.
+The master demuxes frames into a fixed-size shared-memory ring, dispatches
+to whichever worker is free, and reassembles results in frame order before
+writing to ffmpeg. Each worker loads its own `FaceAnalysis` + `INSwapper`
+ORT sessions once at job-start, then runs the fused swap+paste on its slice
+of frames with no GIL contention against the master or other workers.
+
+Same upload form, same HLS player, same `/job/<id>/status` JSON (plus a
+few extra keys: `n_workers`, `worker_warmup_ms`, `paste` timer).
+
+### Why it exists
+
+The single-process Flask sat at ~30 % GPU utilization regardless of workload.
+The GIL was serializing every per-frame Python step — even though numpy
+and cv2 release the GIL during their C calls, Python-side glue (queue ops,
+attribute access, the per-frame match loop) held it just long enough that
+the GPU sat idle between calls. Threading inside one process couldn't
+break that pattern. Multiprocessing does — each worker has its own GIL,
+so paste-back / Python glue from worker A runs concurrently with paste-back
+/ Python glue from worker B, and ORT-level GPU calls overlap across
+different processes at the CUDA-driver level.
+
+### Numbers (RTX 4090 Laptop, 16 GB VRAM + i9, 1080p Bollywood music video)
+
+| Config | proc_fps | Scaling | GPU util | VRAM |
+|---|---|---|---|---|
+| `webapp.py` (single-process baseline) | 4.1 | 1.0× | ~30 % | 3 GB |
+| `webapp_mp.py` N=2 | 6.5 | 1.6× | 16-48 % | 5 GB |
+| `webapp_mp.py` N=4 | 9.8 | 2.4× | 55-81 % | 8 GB |
+| **`webapp_mp.py` N=6 + det_size=480 (full song)** | **33.0** ⭐ | **8.0×** | **87-95 %** | 10.5 GB |
+
+The 33 fps number is the steady-state proc_fps on a full 5-minute 1080p
+song (7902 frames). Short test clips show lower averages because the
+~30 s worker warmup dominates over a 20 s clip.
+
+### How to run
+
+```powershell
+$env:FACESWAP_PORT          = "8082"      # different port from webapp.py
+$env:FACESWAP_WORKERS       = "6"
+$env:FACESWAP_DET_SIZE      = "480"
+$env:FACESWAP_VIDEO_ENCODER = "h264_nvenc"
+conda run -n dlc python webapp_mp.py
+```
+
+Both `webapp.py` and `webapp_mp.py` can run simultaneously on different
+ports. Same job-dir layout, same models, same uploads.
+
+### Phases that did NOT make the cut (logged for future reference)
+
+The full perf exploration ran through 5 phases of in-process optimisation
+before settling on multiprocessing. The journey is in `docs/perf-bench.md`
+and `docs/plans/2026-05-10-flask-gpu-saturation.md`. Notable dead ends:
+
+- **Phase 3 (split paste-back to its own thread)**: regressed 4.4 → 3.5 fps.
+  GIL contention + extra queue overhead exceeded the parallelism win when
+  paste runs 13× longer than the GPU swap. Threads can't escape the GIL;
+  only processes can.
+- **Phase 4 (face batching in inswapper)**: deferred. Small leverage (~5 %
+  at typical face densities) that doesn't compound with multiprocessing.
+- **NVENC output encoder**: ships in `webapp_mp.py` (and is configurable
+  via `FACESWAP_VIDEO_ENCODER`), but the writer was never the bottleneck.
+  The win is freed CPU for paste-back inside each worker.
+
+### Bugs caught and fixed during the rollout (commits on the
+`perf-flask-gpu-saturation` branch)
+
+- **5.5**: `insightface.app.common.Face` couldn't survive `pickle.dumps`
+  across `mp.set_start_method("spawn")` — its `__reduce__` ended up calling
+  a `None` constructor. Workaround: convert to plain dict in the master
+  before pickling; re-wrap as `Face(d)` in the worker (where insightface
+  is imported).
+- **5.6**: At N≥6, all workers calling `onnx.load()` on the same
+  `inswapper_128_fp16.onnx` concurrently triggered intermittent
+  `google.protobuf.message.DecodeError: Error parsing message` — Windows
+  occasionally hands one of the racers a partial buffer. Mitigation: 1-second
+  per-worker stagger via `time.sleep(worker_id)` before opening any models.
+  Sufficient for N≤6; N=8 needs a proper `multiprocessing.Lock` around the
+  load (deferred — GPU is already saturated at N=6 anyway).
+
+### Production config
+
+For a 16 GB RTX 4090 Laptop + Core i9: `FACESWAP_WORKERS=6
+FACESWAP_DET_SIZE=480`. For a 24 GB desktop 4090: same defaults; raising
+to N=8 may give +20 % after the model-load lock fix lands.
+
+### Roll-back
+
+`webapp.py` is unchanged. Just stop `webapp_mp.py` and start `webapp.py`
+on the same port — same UI, same models, same outputs (slower).
+
+---
+
 ## v0.10 — C++ CLI port (offline batch swap, no Python at runtime)
 
 **`cli/`** — fresh top-level directory.

@@ -76,12 +76,23 @@ Windows. ~10 minutes, ~9 GB on disk.
 
 ### 2. Start the web app
 
+**Original single-process** (4-8 fps at 1080p — simple, stable):
 ```powershell
 conda run -n dlc python webapp.py
 ```
 
-Open <http://localhost:8080/>. Drop in your face, optionally a second
-face, and a video. Click "Start live swap".
+**Multiprocessing variant** (33 fps at 1080p — same UI, N worker processes):
+```powershell
+$env:FACESWAP_PORT="8082"; $env:FACESWAP_WORKERS="6"; $env:FACESWAP_DET_SIZE="480"
+conda run -n dlc python webapp_mp.py
+```
+
+Pick whichever fits. Both expose the same upload form / HLS player /
+download links; only the in-process pipeline differs. The multiproc
+variant saturates the GPU (87-95 % SM util in steady state); the original
+sits at ~30 % util but uses less VRAM (3 GB vs 10 GB) and has a smaller
+warmup hit. Open <http://localhost:8080/> (or 8082) and drop in your face,
+optionally a second face, and a video.
 
 ### 3. Watch the live HLS stream (with audio)
 
