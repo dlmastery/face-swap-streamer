@@ -300,23 +300,30 @@ def _run_job(job: Job):
         _set(job, width=in_w, height=in_h, fps=float(fps), total_frames=total)
 
         # ---- Per-source auto-reference extraction ------------------------------
-        # Single video scan: collect every detected face + its gender + bbox
-        # score. Then per-source, pick the largest cluster of matching-gender
-        # faces. Same-gender sources are assigned different clusters so e.g.
-        # two F sources won't both target the same actress.
+        # IDENTITY-FIRST clustering, then per-cluster gender via MAJORITY VOTE.
+        #
+        # Why not group by per-frame genderage label first (the old approach):
+        # insightface's genderage on partially-visible / profile / lighting-
+        # weird frames mis-labels individual faces. The lead actress can show
+        # up as 'M' in 30-40% of frames, so the "M cluster" ends up containing
+        # her embeddings and the M source binds to HER identity — at swap time
+        # her female frames match the (mislabeled-as-M) ref_emb, get swapped
+        # with the male source. That's the M↔F cross-swap users see.
+        #
+        # The fix: cluster ALL face candidates by identity (no gender filter at
+        # extraction). The same person clusters together regardless of single-
+        # frame gender noise. Then label each cluster's gender by majority vote
+        # — robust to ~30% mislabel rate. Finally match each source's gender
+        # (which IS reliable on a clean source photo) to a cluster.
         genders_needed = set(s.gender for s in job.sources)
         _set(job, phase="finding_reference",
              message=f"Scanning video for {' + '.join(sorted(genders_needed))} face{'s' if len(genders_needed) > 1 else ''} to swap onto…")
         step = max(1, int(fps * 2.0))
-        # Min face width to consider as a reference candidate. 25 px is small
-        # — an upscale-ratio of ~25-30x for the inswapper's 128 input — but
-        # accepting these means dance-shot / wide-shot leads are still
-        # cluster-able. The detector's own threshold filters obvious garbage.
         min_ref_face_w = int(os.getenv("FACESWAP_MIN_REF_FACE_W", "25"))
-        # all_candidates: list of (score, embedding, frame_idx, gender)
+        # all_candidates: list of (score, embedding, frame_idx, per_frame_genderage_label)
         all_candidates: list = []
         i = 0
-        max_samples = 120  # was 80 — more samples → better cluster centroid
+        max_samples = 120
         while i < total and len(all_candidates) < max_samples:
             if job.stop_flag.is_set():
                 raise RuntimeError("cancelled")
@@ -325,8 +332,6 @@ def _run_job(job: Job):
             if not ok:
                 break
             for face in fa.get(fr):
-                if face.sex not in genders_needed:
-                    continue
                 w_face = face.bbox[2] - face.bbox[0]
                 if w_face < min_ref_face_w:
                     continue
@@ -335,38 +340,76 @@ def _run_job(job: Job):
             i += step
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-        # For each gender, cluster candidates and pick top clusters (one per
-        # source of that gender).
-        used_idxs: set = set()
-        for gender in genders_needed:
-            same_gender = [(idx, c) for idx, c in enumerate(all_candidates) if c[3] == gender]
-            sources_this_gender = [s for s in job.sources if s.gender == gender]
-            if not same_gender:
-                raise RuntimeError(f"no {gender} face found in the video")
-            embs = np.stack([c[1] for _, c in same_gender])
-            sim = embs @ embs.T
-            scores = np.array([c[0] for _, c in same_gender])
-            for spec in sources_this_gender:
-                # Mask out candidates already claimed by another source.
-                mask = np.array([1.0 if i not in used_idxs else 0.0
-                                 for i, _ in same_gender])
-                if mask.sum() == 0:
-                    # no fresh cluster left — reuse the best one
-                    mask = np.ones(len(same_gender))
-                # Vote count per candidate, weighted by score, masked.
-                votes = (sim > 0.30).sum(axis=1) * scores * mask
-                local_winner = int(np.argmax(votes))
-                global_idx, cand = same_gender[local_winner]
-                spec.ref_emb = cand[1]
-                spec.ref_frame = int(cand[2])
-                spec.ref_votes = int((sim[local_winner] > 0.30).sum())
-                spec.ref_pool = len(same_gender)
-                # Mark all candidates similar to this winner as "used"
-                similar = sim[local_winner] > 0.30
-                for j, (gidx, _) in enumerate(same_gender):
-                    if similar[j]:
-                        used_idxs.add(gidx)
-        # Mirror primary source's ref into top-level fields (back-compat)
+        if not all_candidates:
+            raise RuntimeError("no face found in the video")
+
+        # Cluster all candidates by IDENTITY (no gender filter). Greedy:
+        # at each step take the un-used candidate with the most neighbours
+        # within 0.30 cosine, claim its neighbourhood as one cluster, repeat.
+        embs_all = np.stack([c[1] for c in all_candidates]).astype(np.float32)
+        sim_all = embs_all @ embs_all.T
+        scores_all = np.array([c[0] for c in all_candidates], dtype=np.float32)
+        cluster_thresh = 0.30
+        n_total = len(all_candidates)
+        unused = np.ones(n_total, dtype=bool)
+        clusters = []   # list of dicts: {rep_idx, member_idxs, gender, n}
+        while unused.any():
+            mask_f = unused.astype(np.float32)
+            votes = (sim_all > cluster_thresh).astype(np.float32).sum(axis=1) * scores_all * mask_f
+            rep = int(np.argmax(votes))
+            if not unused[rep] or votes[rep] <= 0:
+                break
+            members = np.where(unused & (sim_all[rep] > cluster_thresh))[0]
+            if len(members) == 0:
+                unused[rep] = False
+                continue
+            member_genders = [all_candidates[m][3] for m in members]
+            n_m = sum(1 for g in member_genders if g == "M")
+            n_f = sum(1 for g in member_genders if g == "F")
+            cluster_gender = "M" if n_m >= n_f else "F"
+            clusters.append({
+                "rep": rep,
+                "members": members,
+                "gender": cluster_gender,
+                "size": int(len(members)),
+                "score": float(scores_all[rep]),
+            })
+            unused[members] = False
+
+        # Sort clusters by size (descending) so the largest gets priority.
+        clusters.sort(key=lambda c: (-c["size"], -c["score"]))
+        print(f"[webapp] reference clusters found: {len(clusters)} "
+              f"(sizes={[c['size'] for c in clusters[:6]]} "
+              f"genders={[c['gender'] for c in clusters[:6]]})", flush=True)
+
+        # Assign each source to a cluster of matching gender, claiming
+        # clusters greedily so two same-gender sources get different clusters.
+        unclaimed = list(clusters)
+        for spec in job.sources:
+            # Try matching gender first.
+            chosen = next((c for c in unclaimed if c["gender"] == spec.gender), None)
+            if chosen is None and unclaimed:
+                # Fallback: take the largest remaining cluster regardless of gender.
+                # This handles videos where genderage is so unreliable that no
+                # cluster carries the expected majority — still produces a swap.
+                chosen = unclaimed[0]
+                print(f"[webapp] WARNING: no {spec.gender} cluster — falling back "
+                      f"to largest cluster (size={chosen['size']}, "
+                      f"genderage_majority={chosen['gender']})", flush=True)
+            if chosen is None:
+                raise RuntimeError(f"no usable face cluster in the video")
+            unclaimed.remove(chosen)
+            # Centroid = mean of L2-normed member embeddings, re-normalised.
+            # Single-frame "rep" embedding alone is sensitive to whatever pose
+            # the rep happened to be in; mean smooths across all cluster members.
+            mems = embs_all[chosen["members"]]
+            cen = mems.mean(axis=0)
+            n = float(np.linalg.norm(cen))
+            spec.ref_emb = (cen / n).astype(np.float32) if n > 0 else mems[0].astype(np.float32)
+            spec.ref_frame = int(all_candidates[chosen["rep"]][2])
+            spec.ref_votes = chosen["size"]
+            spec.ref_pool = sum(1 for c in clusters if c["gender"] == spec.gender) or len(clusters)
+
         primary = job.sources[0]
         _set(job, ref_frame=primary.ref_frame, ref_votes=primary.ref_votes,
              ref_pool=primary.ref_pool)
@@ -382,7 +425,10 @@ def _run_job(job: Job):
         # embeddings, so 0.18 (down from 0.22) keeps far-away/blurry leads
         # in the swap. Override via env var if you see false-positive swaps
         # on extras — bump to 0.25 or 0.30 for stricter matching.
-        REFERENCE_THRESH = float(os.getenv("FACESWAP_REF_THRESH", "0.18"))
+        # 0.15 default: with the centroid (mean-of-cluster) reference embedding
+        # this captures the lead even on profile / wide / partially-occluded
+        # frames. Below 0.10 starts false-positiving on lookalike extras.
+        REFERENCE_THRESH = float(os.getenv("FACESWAP_REF_THRESH", "0.15"))
 
         # Pre-stack reference embeddings for fast per-frame matching against
         # all sources at once.
@@ -431,18 +477,8 @@ def _run_job(job: Job):
                     if tgt_faces:
                         tgt_embs = np.stack([f.normed_embedding for f in tgt_faces])
                         sims = tgt_embs @ ref_embs.T          # (T, S)
-                        # Gender-gate before argmax. Without this, a 2-source M+F
-                        # job can flip argmax between sources frame-to-frame when
-                        # cosine sims are close → cross-gender swap + flicker.
-                        src_genders = np.array(
-                            [s.gender for s in ref_sources], dtype="<U1"
-                        )
                         for ti, tface in enumerate(tgt_faces):
-                            allowed = (src_genders == tface.sex)
-                            if not allowed.any():
-                                allowed = np.ones_like(allowed)
-                            masked = np.where(allowed, sims[ti], -np.inf)
-                            si = int(np.argmax(masked))
+                            si = int(np.argmax(sims[ti]))
                             if float(sims[ti, si]) >= REFERENCE_THRESH:
                                 picks.append((tface, si))
                     detect_q.put((frame, picks))

@@ -348,23 +348,21 @@ def _run_job(job: Job):
         _set(job, width=in_w, height=in_h, fps=float(fps), total_frames=total)
 
         # ---- Per-source auto-reference extraction ------------------------------
-        # Single video scan: collect every detected face + its gender + bbox
-        # score. Then per-source, pick the largest cluster of matching-gender
-        # faces. Same-gender sources are assigned different clusters so e.g.
-        # two F sources won't both target the same actress.
+        # IDENTITY-FIRST clustering, then per-cluster gender via MAJORITY VOTE.
+        # See webapp.py for the long-form rationale. Short version: per-frame
+        # genderage on the video is noisy enough that grouping by it BEFORE
+        # clustering puts the lead actress in the M bucket whenever she's
+        # mislabeled, which contaminates the M source's reference embedding
+        # and causes the M↔F cross-swap. Identity clustering first → majority-
+        # vote gender second is robust to ~30% mislabel rate.
         genders_needed = set(s.gender for s in job.sources)
         _set(job, phase="finding_reference",
              message=f"Scanning video for {' + '.join(sorted(genders_needed))} face{'s' if len(genders_needed) > 1 else ''} to swap onto…")
         step = max(1, int(fps * 2.0))
-        # Min face width to consider as a reference candidate. 25 px is small
-        # — an upscale-ratio of ~25-30x for the inswapper's 128 input — but
-        # accepting these means dance-shot / wide-shot leads are still
-        # cluster-able. The detector's own threshold filters obvious garbage.
         min_ref_face_w = int(os.getenv("FACESWAP_MIN_REF_FACE_W", "25"))
-        # all_candidates: list of (score, embedding, frame_idx, gender)
         all_candidates: list = []
         i = 0
-        max_samples = 120  # was 80 — more samples → better cluster centroid
+        max_samples = 120
         while i < total and len(all_candidates) < max_samples:
             if job.stop_flag.is_set():
                 raise RuntimeError("cancelled")
@@ -373,8 +371,6 @@ def _run_job(job: Job):
             if not ok:
                 break
             for face in fa.get(fr):
-                if face.sex not in genders_needed:
-                    continue
                 w_face = face.bbox[2] - face.bbox[0]
                 if w_face < min_ref_face_w:
                     continue
@@ -383,37 +379,64 @@ def _run_job(job: Job):
             i += step
         cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
 
-        # For each gender, cluster candidates and pick top clusters (one per
-        # source of that gender).
-        used_idxs: set = set()
-        for gender in genders_needed:
-            same_gender = [(idx, c) for idx, c in enumerate(all_candidates) if c[3] == gender]
-            sources_this_gender = [s for s in job.sources if s.gender == gender]
-            if not same_gender:
-                raise RuntimeError(f"no {gender} face found in the video")
-            embs = np.stack([c[1] for _, c in same_gender])
-            sim = embs @ embs.T
-            scores = np.array([c[0] for _, c in same_gender])
-            for spec in sources_this_gender:
-                # Mask out candidates already claimed by another source.
-                mask = np.array([1.0 if i not in used_idxs else 0.0
-                                 for i, _ in same_gender])
-                if mask.sum() == 0:
-                    # no fresh cluster left — reuse the best one
-                    mask = np.ones(len(same_gender))
-                # Vote count per candidate, weighted by score, masked.
-                votes = (sim > 0.30).sum(axis=1) * scores * mask
-                local_winner = int(np.argmax(votes))
-                global_idx, cand = same_gender[local_winner]
-                spec.ref_emb = cand[1]
-                spec.ref_frame = int(cand[2])
-                spec.ref_votes = int((sim[local_winner] > 0.30).sum())
-                spec.ref_pool = len(same_gender)
-                # Mark all candidates similar to this winner as "used"
-                similar = sim[local_winner] > 0.30
-                for j, (gidx, _) in enumerate(same_gender):
-                    if similar[j]:
-                        used_idxs.add(gidx)
+        if not all_candidates:
+            raise RuntimeError("no face found in the video")
+
+        embs_all = np.stack([c[1] for c in all_candidates]).astype(np.float32)
+        sim_all = embs_all @ embs_all.T
+        scores_all = np.array([c[0] for c in all_candidates], dtype=np.float32)
+        cluster_thresh = 0.30
+        n_total = len(all_candidates)
+        unused = np.ones(n_total, dtype=bool)
+        clusters = []
+        while unused.any():
+            mask_f = unused.astype(np.float32)
+            votes = (sim_all > cluster_thresh).astype(np.float32).sum(axis=1) * scores_all * mask_f
+            rep = int(np.argmax(votes))
+            if not unused[rep] or votes[rep] <= 0:
+                break
+            members = np.where(unused & (sim_all[rep] > cluster_thresh))[0]
+            if len(members) == 0:
+                unused[rep] = False
+                continue
+            member_genders = [all_candidates[m][3] for m in members]
+            n_m = sum(1 for g in member_genders if g == "M")
+            n_f = sum(1 for g in member_genders if g == "F")
+            cluster_gender = "M" if n_m >= n_f else "F"
+            clusters.append({
+                "rep": rep,
+                "members": members,
+                "gender": cluster_gender,
+                "size": int(len(members)),
+                "score": float(scores_all[rep]),
+            })
+            unused[members] = False
+
+        clusters.sort(key=lambda c: (-c["size"], -c["score"]))
+        print(f"[webapp] reference clusters found: {len(clusters)} "
+              f"(sizes={[c['size'] for c in clusters[:6]]} "
+              f"genders={[c['gender'] for c in clusters[:6]]})", flush=True)
+
+        unclaimed = list(clusters)
+        for spec in job.sources:
+            chosen = next((c for c in unclaimed if c["gender"] == spec.gender), None)
+            if chosen is None and unclaimed:
+                chosen = unclaimed[0]
+                print(f"[webapp] WARNING: no {spec.gender} cluster — falling back "
+                      f"to largest cluster (size={chosen['size']}, "
+                      f"genderage_majority={chosen['gender']})", flush=True)
+            if chosen is None:
+                raise RuntimeError("no usable face cluster in the video")
+            unclaimed.remove(chosen)
+            # Centroid = mean of L2-normed member embeddings, re-normalised.
+            # More robust than a single-frame "rep" embedding to face-pose drift.
+            mems = embs_all[chosen["members"]]
+            cen = mems.mean(axis=0)
+            n = float(np.linalg.norm(cen))
+            spec.ref_emb = (cen / n).astype(np.float32) if n > 0 else mems[0].astype(np.float32)
+            spec.ref_frame = int(all_candidates[chosen["rep"]][2])
+            spec.ref_votes = chosen["size"]
+            spec.ref_pool = sum(1 for c in clusters if c["gender"] == spec.gender) or len(clusters)
         # Mirror primary source's ref into top-level fields (back-compat)
         primary = job.sources[0]
         _set(job, ref_frame=primary.ref_frame, ref_votes=primary.ref_votes,
@@ -430,7 +453,10 @@ def _run_job(job: Job):
         # embeddings, so 0.18 (down from 0.22) keeps far-away/blurry leads
         # in the swap. Override via env var if you see false-positive swaps
         # on extras — bump to 0.25 or 0.30 for stricter matching.
-        REFERENCE_THRESH = float(os.getenv("FACESWAP_REF_THRESH", "0.18"))
+        # 0.15 default: with the centroid (mean-of-cluster) reference embedding
+        # this captures the lead even on profile / wide / partially-occluded
+        # frames. Below 0.10 starts false-positiving on lookalike extras.
+        REFERENCE_THRESH = float(os.getenv("FACESWAP_REF_THRESH", "0.15"))
 
         # Pre-stack reference embeddings for fast per-frame matching against
         # all sources at once.
@@ -1464,8 +1490,11 @@ const PHASE_LABELS = {
 let hls = null;
 let streamShown = false;
 let playStarted = false;
-const PREBUFFER_TARGET = 15;   // seconds we want buffered ahead before pressing play
-const REBUFFER_TARGET = 8;     // when we stall, wait for this many seconds before resuming
+// The mp pipeline produces frames faster than realtime (~25+ fps at 1080p with N=6
+// workers), so a short prebuffer is plenty. 4 s covers ffmpeg's HLS segment cadence
+// (`-hls_time 2`) plus one safety segment without the user staring at a buffering pill.
+const PREBUFFER_TARGET = 4;
+const REBUFFER_TARGET = 3;
 const unmuteOverlay = document.getElementById('unmute');
 
 function bufferedAhead() {
