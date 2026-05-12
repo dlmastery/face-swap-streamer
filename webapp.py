@@ -378,37 +378,50 @@ def _run_job(job: Job):
 
         # Sort clusters by size (descending) so the largest gets priority.
         clusters.sort(key=lambda c: (-c["size"], -c["score"]))
-        print(f"[webapp] reference clusters found: {len(clusters)} "
-              f"(sizes={[c['size'] for c in clusters[:6]]} "
-              f"genders={[c['gender'] for c in clusters[:6]]})", flush=True)
+        for c in clusters:
+            ms = sum(1 for m in c["members"] if all_candidates[m][3] == "M")
+            fs = sum(1 for m in c["members"] if all_candidates[m][3] == "F")
+            tot = max(1, ms + fs)
+            c["m_frac"] = ms / tot
+            c["f_frac"] = fs / tot
 
-        # Assign each source to a cluster of matching gender, claiming
-        # clusters greedily so two same-gender sources get different clusters.
-        unclaimed = list(clusters)
-        for spec in job.sources:
-            # Try matching gender first.
-            chosen = next((c for c in unclaimed if c["gender"] == spec.gender), None)
-            if chosen is None and unclaimed:
-                # Fallback: take the largest remaining cluster regardless of gender.
-                # This handles videos where genderage is so unreliable that no
-                # cluster carries the expected majority — still produces a swap.
-                chosen = unclaimed[0]
-                print(f"[webapp] WARNING: no {spec.gender} cluster — falling back "
-                      f"to largest cluster (size={chosen['size']}, "
-                      f"genderage_majority={chosen['gender']})", flush=True)
-            if chosen is None:
-                raise RuntimeError(f"no usable face cluster in the video")
-            unclaimed.remove(chosen)
-            # Centroid = mean of L2-normed member embeddings, re-normalised.
-            # Single-frame "rep" embedding alone is sensitive to whatever pose
-            # the rep happened to be in; mean smooths across all cluster members.
-            mems = embs_all[chosen["members"]]
+        K = len(job.sources)
+        top_k = clusters[:K]
+        if len(top_k) < K:
+            top_k = (top_k + [clusters[0]] * K)[:K]
+        print(f"[webapp] reference clusters: total={len(clusters)} "
+              f"using top-{K} (sizes={[c['size'] for c in top_k]} "
+              f"m_frac={[round(c['m_frac'],2) for c in top_k]})", flush=True)
+
+        # Globally maximise gender-compatibility weighted by cluster size.
+        # See webapp_mp.py for the rationale; same algorithm.
+        from itertools import permutations
+        sources_list = list(job.sources)
+        best_score = -1.0
+        best_perm = tuple(range(K))
+        for perm in permutations(range(K)):
+            score = 0.0
+            for si, ci in enumerate(perm):
+                cluster = top_k[ci]
+                frac = cluster["m_frac"] if sources_list[si].gender == "M" else cluster["f_frac"]
+                score += frac * cluster["size"]
+            if score > best_score:
+                best_score = score
+                best_perm = perm
+        print(f"[webapp] cluster assignment: "
+              f"{[(sources_list[si].gender, top_k[ci]['size']) for si, ci in enumerate(best_perm)]} "
+              f"score={best_score:.2f}", flush=True)
+
+        for si, ci in enumerate(best_perm):
+            cluster = top_k[ci]
+            spec = sources_list[si]
+            mems = embs_all[cluster["members"]]
             cen = mems.mean(axis=0)
             n = float(np.linalg.norm(cen))
             spec.ref_emb = (cen / n).astype(np.float32) if n > 0 else mems[0].astype(np.float32)
-            spec.ref_frame = int(all_candidates[chosen["rep"]][2])
-            spec.ref_votes = chosen["size"]
-            spec.ref_pool = sum(1 for c in clusters if c["gender"] == spec.gender) or len(clusters)
+            spec.ref_frame = int(all_candidates[cluster["rep"]][2])
+            spec.ref_votes = cluster["size"]
+            spec.ref_pool = len(clusters)
 
         primary = job.sources[0]
         _set(job, ref_frame=primary.ref_frame, ref_votes=primary.ref_votes,
