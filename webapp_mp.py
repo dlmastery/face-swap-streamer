@@ -107,6 +107,10 @@ class Job:
     started: float = field(default_factory=time.time)
     finished: float = 0.0
     stop_flag: threading.Event = field(default_factory=threading.Event)
+    # When set, the demux loop sleeps without dispatching new frames. Workers
+    # drain their in-flight queue and idle; ffmpeg stdin stays open. Clearing
+    # the event resumes dispatch from the current cv2 cursor position.
+    pause_flag: threading.Event = field(default_factory=threading.Event)
     timers: dict = field(default_factory=dict)   # name -> StageTimer; populated in _run_job
     # ---- Phase 5 telemetry (multiprocess swap-worker fan-out) -------------
     n_workers: int = 0           # number of swap-worker processes (== FACESWAP_WORKERS)
@@ -656,10 +660,21 @@ def _run_job(job: Job):
                 worker_error / stop_flag (otherwise a fully-crashed worker pool
                 would deadlock demux forever holding all slots). END-of-stream
                 just exits the loop; the writer thread observes all_dispatched
-                + done length to know when to finish."""
+                + done length to know when to finish.
+
+                Pause: when job.pause_flag is set, the loop sleeps without reading
+                more frames. Workers drain their queue and idle. ffmpeg holds the
+                pipe open with no new bytes — HLS playback in the browser will
+                eventually stall at the end of buffered segments. Clearing
+                pause_flag resumes from the current cv2 cursor position."""
                 frame_idx = 0
                 try:
                     while not job.stop_flag.is_set() and not broken and not worker_error:
+                        # Pause loop — sleeps cheaply, re-checks stop on every wake.
+                        while job.pause_flag.is_set():
+                            if job.stop_flag.is_set() or broken or worker_error:
+                                return
+                            time.sleep(0.1)
                         t = time.perf_counter()
                         ok, fr = cap.read()
                         timers["read"].record((time.perf_counter() - t) * 1000)
@@ -1379,6 +1394,25 @@ VIEWER_HTML = r"""<!doctype html><html lang="en"><head>
   .meta .k { color: var(--ink-2); }
   .meta .v { color: var(--ink-0); font-weight:500; }
 
+  /* Job control buttons (Pause / Resume / Stop) */
+  .jobctl { display:flex; gap:.6rem; margin-top:.8rem; }
+  .jobctl .ctl {
+    background: rgba(255,255,255,0.06);
+    border: 1px solid rgba(255,255,255,0.15);
+    color: var(--ink-0);
+    padding: .35rem .85rem;
+    border-radius: 6px;
+    font-size: .85rem;
+    font-family: inherit;
+    cursor: pointer;
+    transition: background .12s ease, border-color .12s ease;
+  }
+  .jobctl .ctl:hover { background: rgba(255,255,255,0.10); border-color: rgba(255,255,255,0.25); }
+  .jobctl .ctl:active { transform: translateY(1px); }
+  .jobctl .ctl:disabled { opacity: 0.45; cursor: not-allowed; }
+  .jobctl .ctl.danger { background: rgba(255,80,80,0.08); border-color: rgba(255,80,80,0.30); color:#ffb0b0; }
+  .jobctl .ctl.danger:hover { background: rgba(255,80,80,0.16); }
+
   /* Done card with prominent download */
   .done-card { width:100%;
     background: linear-gradient(135deg, rgba(82,214,163,.08), rgba(58,161,255,.08));
@@ -1442,6 +1476,11 @@ VIEWER_HTML = r"""<!doctype html><html lang="en"><head>
       <span><span class="k">fps</span> <span class="v" id="m_fps">–</span></span>
       <span><span class="k">swaps</span> <span class="v" id="m_swap">0</span></span>
       <span id="m_extra"></span>
+    </div>
+    <div class="jobctl">
+      <button id="btn_pause" class="ctl">⏸ Pause</button>
+      <button id="btn_resume" class="ctl" style="display:none">▶ Resume</button>
+      <button id="btn_stop" class="ctl danger">⏹ Stop</button>
     </div>
   </div>
 
@@ -1647,6 +1686,17 @@ async function poll() {
   if (r.proc_fps > 0) document.getElementById('m_fps').textContent = r.proc_fps.toFixed(1);
   document.getElementById('m_swap').textContent = r.swap_count;
 
+  // Toggle pause/resume button visibility based on backend state.
+  const btnPause  = document.getElementById('btn_pause');
+  const btnResume = document.getElementById('btn_resume');
+  const btnStop   = document.getElementById('btn_stop');
+  if (btnPause && btnResume && btnStop) {
+    const terminal = r.phase === 'done' || r.phase === 'error';
+    btnPause.style.display  = (!terminal && !r.paused) ? '' : 'none';
+    btnResume.style.display = (!terminal &&  r.paused) ? '' : 'none';
+    btnStop.disabled = terminal;
+  }
+
   if ((r.phase === "streaming" || r.phase === "finalising" || r.phase === "done") && !streamShown) {
     attachStream();
   }
@@ -1669,6 +1719,34 @@ async function poll() {
   setTimeout(poll, 400);
 }
 poll();
+
+// Pause / Resume / Stop button handlers.
+async function postCtl(action) {
+  try {
+    const r = await fetch(`/job/${JOB}/${action}`, { method: 'POST' });
+    if (!r.ok) console.warn(`/${action} -> ${r.status}`);
+  } catch (e) { console.warn(`/${action} failed`, e); }
+}
+document.getElementById('btn_pause').addEventListener('click', () => {
+  document.getElementById('btn_pause').disabled = true;
+  postCtl('pause').finally(() => {
+    document.getElementById('btn_pause').disabled = false;
+  });
+});
+document.getElementById('btn_resume').addEventListener('click', () => {
+  document.getElementById('btn_resume').disabled = true;
+  postCtl('resume').finally(() => {
+    document.getElementById('btn_resume').disabled = false;
+    // Nudge the player back into life if it stalled while paused.
+    if (!playStarted) tryStartPlayback();
+    else if (player.paused) player.play().catch(()=>{});
+  });
+});
+document.getElementById('btn_stop').addEventListener('click', () => {
+  if (!confirm('Stop the conversion? Partial output may be saved but the job ends now.')) return;
+  document.getElementById('btn_stop').disabled = true;
+  postCtl('stop');
+});
 </script>
 </body></html>
 """
@@ -1764,7 +1842,54 @@ def status(job_id: str):
         # Phase 5 telemetry
         "n_workers": job.n_workers,
         "worker_warmup_ms": job.worker_warmup_ms,
+        # Pause/resume state (controlled by /pause and /resume routes).
+        "paused": job.pause_flag.is_set(),
     })
+
+
+@app.route("/job/<job_id>/pause", methods=["POST"])
+def pause_job(job_id: str):
+    """Immediate-halt the demux loop. Workers drain, ffmpeg holds the pipe open
+    with no new bytes. HLS playback in the browser will stall after consuming
+    its already-written segments. Idempotent (already-paused returns 200)."""
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"phase": "error", "message": "no such job"}), 404
+    if job.phase in ("done", "error"):
+        return jsonify({"paused": False, "message": f"job already {job.phase}"}), 409
+    job.pause_flag.set()
+    print(f"[webapp] job {job_id} paused at frame {job.current_frame}/{job.total_frames}", flush=True)
+    return jsonify({"paused": True, "current_frame": job.current_frame})
+
+
+@app.route("/job/<job_id>/resume", methods=["POST"])
+def resume_job(job_id: str):
+    """Clear the pause flag; demux loop continues from current cv2 cursor."""
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"phase": "error", "message": "no such job"}), 404
+    if job.phase in ("done", "error"):
+        return jsonify({"paused": False, "message": f"job already {job.phase}"}), 409
+    job.pause_flag.clear()
+    print(f"[webapp] job {job_id} resumed at frame {job.current_frame}/{job.total_frames}", flush=True)
+    return jsonify({"paused": False, "current_frame": job.current_frame})
+
+
+@app.route("/job/<job_id>/stop", methods=["POST"])
+def stop_job(job_id: str):
+    """Hard-stop: aborts the job entirely. Workers terminate, ffmpeg closes,
+    partial swapped.mp4 may exist on disk."""
+    job = JOBS.get(job_id)
+    if not job:
+        return jsonify({"phase": "error", "message": "no such job"}), 404
+    if job.phase in ("done", "error"):
+        return jsonify({"stopped": False, "message": f"job already {job.phase}"}), 409
+    # Clear pause so the demux loop's pause-sleep exits and immediately
+    # observes stop_flag.
+    job.pause_flag.clear()
+    job.stop_flag.set()
+    print(f"[webapp] job {job_id} HARD-STOPPED at frame {job.current_frame}/{job.total_frames}", flush=True)
+    return jsonify({"stopped": True, "current_frame": job.current_frame})
 
 
 @app.route("/job/<job_id>/hls/<path:fname>")
