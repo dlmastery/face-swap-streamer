@@ -75,6 +75,11 @@ class SourceSpec:
     age: int = 0
     src_face: object = None        # insightface Face object — kept alive
     ref_emb: object = None         # numpy embedding of the matching cluster centroid
+    # Per-frame embeddings of all cluster members (M, 512). Used for
+    # nearest-neighbour matching at swap time: max(tgt @ member_i.T) instead
+    # of (tgt @ centroid). Captures pose variation within the cluster and
+    # eliminates threshold-boundary flicker.
+    ref_members: object = None     # numpy (M, D) float32 of cluster member embeddings
     ref_frame: int = -1
     ref_votes: int = 0
     ref_pool: int = 0
@@ -468,10 +473,13 @@ def _run_job(job: Job):
             cluster = top_k[ci]
             spec = sources_list[si]
             # Centroid = mean of L2-normed member embeddings, re-normalised.
-            mems = embs_all[cluster["members"]]
+            # Kept for status JSON + back-compat; the actual matching now uses
+            # nearest-neighbour over members (spec.ref_members below).
+            mems = embs_all[cluster["members"]].astype(np.float32)
             cen = mems.mean(axis=0)
             n = float(np.linalg.norm(cen))
-            spec.ref_emb = (cen / n).astype(np.float32) if n > 0 else mems[0].astype(np.float32)
+            spec.ref_emb = (cen / n).astype(np.float32) if n > 0 else mems[0]
+            spec.ref_members = mems   # (M, D) — used for NN matching at swap time
             spec.ref_frame = int(all_candidates[cluster["rep"]][2])
             spec.ref_votes = cluster["size"]
             spec.ref_pool = len(clusters)
@@ -558,6 +566,13 @@ def _run_job(job: Job):
         ]
         ref_embs_bytes = pickle.dumps(ref_embs)
         ref_sources_pickled = pickle.dumps(ref_sources_for_workers)
+        # Cluster member embeddings, one (M_i, D) array per source. Workers
+        # use these for NN matching (max sim over members) instead of just
+        # centroid sim — kills the threshold-boundary flicker.
+        ref_members_pickled = pickle.dumps(
+            [s.ref_members if s.ref_members is not None else np.zeros((0, 512), dtype=np.float32)
+             for s in job.sources]
+        )
 
         # Shared frame pool sized at the SOURCE video resolution.
         # Init names BEFORE the try-block so the finally can always clean up.
@@ -582,7 +597,7 @@ def _run_job(job: Job):
                     target=worker_main,
                     args=(
                         wid, in_q, out_q, shm_names, (in_h, in_w, 3),
-                        ref_embs_bytes, ref_sources_pickled,
+                        ref_embs_bytes, ref_sources_pickled, ref_members_pickled,
                         det_size, det_thresh, REFERENCE_THRESH,
                         face_model, SWAPPER_PATH,
                     ),

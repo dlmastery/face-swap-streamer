@@ -215,8 +215,9 @@ def worker_main(
     out_q,                      # mp.Queue[SwapResponse]
     shm_names: list,            # list[str] of SharedMemory names (one per slot)
     shape: tuple,               # (H, W, 3) — slot frame shape
-    ref_embs_bytes: bytes,      # pickled numpy.ndarray, shape (S, D)
+    ref_embs_bytes: bytes,      # pickled numpy.ndarray, shape (S, D) — centroids
     ref_sources_pickled: bytes, # pickled list[SourceSpec-like dict]
+    ref_members_pickled: bytes, # pickled list[numpy.ndarray (M_s, D)] — per-source cluster members
     det_size: int,              # face detector input (square)
     det_thresh: float,          # detector confidence threshold
     ref_thresh: float,          # cosine-sim threshold for source-match
@@ -288,6 +289,24 @@ def worker_main(
             for s in ref_sources_raw
         ]
         ref_embs_T = ref_embs.T  # (D, S) — pre-transpose for the per-frame matmul
+        # Per-source cluster member embeddings for NN-over-members matching.
+        # Shape per element: (M_s, D). max(tgt @ member.T) is more robust than
+        # tgt @ centroid because it captures pose / lighting variation within
+        # the cluster. Stack into (total_M, D) + a (total_M,) source-index map
+        # so the per-frame matmul stays one big GEMM, then per-cluster max.
+        ref_members_per = pickle.loads(ref_members_pickled)  # list of (M_s, D)
+        if any(m.size > 0 for m in ref_members_per):
+            stacked = np.concatenate(
+                [m for m in ref_members_per if m.size > 0], axis=0
+            ).astype(np.float32)
+            source_idx_map = np.concatenate(
+                [np.full(m.shape[0], s, dtype=np.int32)
+                 for s, m in enumerate(ref_members_per) if m.size > 0]
+            )
+            stacked_T = stacked.T   # (D, total_M) for tgt @ stacked_T
+        else:
+            stacked_T = None
+            source_idx_map = None
 
         # Attach the shared-memory slots and build per-slot numpy views ONCE.
         # Per-frame we just index into `slot_views[slot_id]`; no slicing or
@@ -329,11 +348,29 @@ def worker_main(
                 frame = slot_views[slot_id]
 
                 # Detect + match against the pre-stacked source references.
+                # NN-over-members: per target face, per source, compute the MAX
+                # cosine sim across all cluster members (not just the centroid).
+                # A face that closely matches any one member is "in the cluster"
+                # even if its embedding has drifted from the centroid due to
+                # pose / lighting. This kills threshold-boundary flicker —
+                # max-over-members is much more stable per-frame than
+                # centroid-only sim.
                 tgt_faces = fa.get(frame)
                 n_swapped = 0
                 if tgt_faces:
-                    tgt_embs = np.stack([f.normed_embedding for f in tgt_faces])
-                    sims = tgt_embs @ ref_embs_T          # (T, S)
+                    tgt_embs = np.stack([f.normed_embedding for f in tgt_faces]).astype(np.float32)
+                    if stacked_T is not None and source_idx_map is not None:
+                        # (T, total_M) — sim of each target to every cluster member.
+                        all_sims = tgt_embs @ stacked_T
+                        S = len(ref_sources)
+                        # Per source: take max across that source's columns.
+                        sims = np.full((all_sims.shape[0], S), -1.0, dtype=np.float32)
+                        for s in range(S):
+                            cols = (source_idx_map == s)
+                            if cols.any():
+                                sims[:, s] = all_sims[:, cols].max(axis=1)
+                    else:
+                        sims = tgt_embs @ ref_embs_T      # fallback to centroid sim
                     for ti, tface in enumerate(tgt_faces):
                         si = int(np.argmax(sims[ti]))
                         if float(sims[ti, si]) >= ref_thresh:

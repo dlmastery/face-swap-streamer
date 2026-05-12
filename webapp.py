@@ -72,6 +72,7 @@ class SourceSpec:
     age: int = 0
     src_face: object = None        # insightface Face object — kept alive
     ref_emb: object = None         # numpy embedding of the matching cluster centroid
+    ref_members: object = None     # numpy (M, D) cluster member embeddings for NN matching
     ref_frame: int = -1
     ref_votes: int = 0
     ref_pool: int = 0
@@ -415,10 +416,11 @@ def _run_job(job: Job):
         for si, ci in enumerate(best_perm):
             cluster = top_k[ci]
             spec = sources_list[si]
-            mems = embs_all[cluster["members"]]
+            mems = embs_all[cluster["members"]].astype(np.float32)
             cen = mems.mean(axis=0)
             n = float(np.linalg.norm(cen))
-            spec.ref_emb = (cen / n).astype(np.float32) if n > 0 else mems[0].astype(np.float32)
+            spec.ref_emb = (cen / n).astype(np.float32) if n > 0 else mems[0]
+            spec.ref_members = mems  # used by NN-over-members matching below
             spec.ref_frame = int(all_candidates[cluster["rep"]][2])
             spec.ref_votes = cluster["size"]
             spec.ref_pool = len(clusters)
@@ -444,9 +446,24 @@ def _run_job(job: Job):
         REFERENCE_THRESH = float(os.getenv("FACESWAP_REF_THRESH", "0.15"))
 
         # Pre-stack reference embeddings for fast per-frame matching against
-        # all sources at once.
+        # all sources at once. We use NN-over-members rather than centroid sim
+        # (much more robust to per-frame pose / lighting noise — kills the
+        # threshold-boundary flicker).
         ref_embs = np.stack([s.ref_emb for s in job.sources])  # shape (S, D)
         ref_sources = list(job.sources)                        # parallel index
+        # Stack all cluster members into one (total_M, D) matrix + source-idx map
+        # for a single big GEMM per frame. Per-source sim = max over its columns.
+        _member_arrs = [s.ref_members for s in job.sources if s.ref_members is not None and s.ref_members.size > 0]
+        if _member_arrs:
+            members_stacked_T = np.concatenate(_member_arrs, axis=0).astype(np.float32).T  # (D, total_M)
+            members_src_idx = np.concatenate(
+                [np.full(m.shape[0], si, dtype=np.int32)
+                 for si, m in enumerate(job.sources)
+                 if m.ref_members is not None and m.ref_members.size > 0]
+            )
+        else:
+            members_stacked_T = None
+            members_src_idx = None
 
         # ---- 4-stage pipeline: reader -> detector -> swapper -> writer --------
         # Each stage runs in its own thread, hand-off via bounded queues. This
@@ -488,8 +505,17 @@ def _run_job(job: Job):
                     tgt_faces = fa.get(frame)
                     picks = []
                     if tgt_faces:
-                        tgt_embs = np.stack([f.normed_embedding for f in tgt_faces])
-                        sims = tgt_embs @ ref_embs.T          # (T, S)
+                        tgt_embs = np.stack([f.normed_embedding for f in tgt_faces]).astype(np.float32)
+                        if members_stacked_T is not None:
+                            all_sims = tgt_embs @ members_stacked_T   # (T, total_M)
+                            S = len(ref_sources)
+                            sims = np.full((all_sims.shape[0], S), -1.0, dtype=np.float32)
+                            for s in range(S):
+                                cols = (members_src_idx == s)
+                                if cols.any():
+                                    sims[:, s] = all_sims[:, cols].max(axis=1)
+                        else:
+                            sims = tgt_embs @ ref_embs.T              # fallback: centroid sim
                         for ti, tface in enumerate(tgt_faces):
                             si = int(np.argmax(sims[ti]))
                             if float(sims[ti, si]) >= REFERENCE_THRESH:
