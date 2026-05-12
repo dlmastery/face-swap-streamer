@@ -334,8 +334,23 @@ def worker_main(
                 if tgt_faces:
                     tgt_embs = np.stack([f.normed_embedding for f in tgt_faces])
                     sims = tgt_embs @ ref_embs_T          # (T, S)
+                    # Pre-build per-source gender vector for masking.
+                    src_genders = np.array(
+                        [s["gender"] for s in ref_sources], dtype="<U1"
+                    )
                     for ti, tface in enumerate(tgt_faces):
-                        si = int(np.argmax(sims[ti]))
+                        # Gender-gate: only consider sources whose gender
+                        # matches the detected target face's sex. Without this,
+                        # two-source M+F jobs can flip argmax between the M and
+                        # F sources when their cosine sims are close, producing
+                        # cross-gender swaps and frame-to-frame flicker.
+                        allowed = (src_genders == tface.sex)
+                        if not allowed.any():
+                            # No source of matching gender — fall back to all
+                            # so a single-source job still works.
+                            allowed = np.ones_like(allowed)
+                        masked = np.where(allowed, sims[ti], -np.inf)
+                        si = int(np.argmax(masked))
                         if float(sims[ti, si]) >= ref_thresh:
                             # Fused swap+paste — same call shape as the
                             # in-process Phase 2 path; matches its output byte-for-byte

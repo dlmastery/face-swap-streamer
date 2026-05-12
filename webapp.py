@@ -431,8 +431,18 @@ def _run_job(job: Job):
                     if tgt_faces:
                         tgt_embs = np.stack([f.normed_embedding for f in tgt_faces])
                         sims = tgt_embs @ ref_embs.T          # (T, S)
+                        # Gender-gate before argmax. Without this, a 2-source M+F
+                        # job can flip argmax between sources frame-to-frame when
+                        # cosine sims are close → cross-gender swap + flicker.
+                        src_genders = np.array(
+                            [s.gender for s in ref_sources], dtype="<U1"
+                        )
                         for ti, tface in enumerate(tgt_faces):
-                            si = int(np.argmax(sims[ti]))
+                            allowed = (src_genders == tface.sex)
+                            if not allowed.any():
+                                allowed = np.ones_like(allowed)
+                            masked = np.where(allowed, sims[ti], -np.inf)
+                            si = int(np.argmax(masked))
                             if float(sims[ti, si]) >= REFERENCE_THRESH:
                                 picks.append((tface, si))
                     detect_q.put((frame, picks))
