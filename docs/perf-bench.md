@@ -17,6 +17,7 @@ Each row records the timer snapshot at the **end** of the swap stream (just befo
 | 5 N=8 (clip_20s) | crash | — | — | — | — | — | — | — | — | — | worker 0 fails: protobuf DecodeError during onnx.load even with 1s stagger; needs `multiprocessing.Lock` around model load. Deferred. |
 | 5 N=6 det_size=480 (clip_20s) | 11.8 | — | n/a | n/a | n/a | — | 2-17% | active | n/a | 313 | det_size win small at 1080p (only +5%); swap dominates |
 | **5 N=6 det_size=480 FULL 5min song** | **33.0** ⭐ | — | n/a | n/a | n/a | — | **87-95%** | active | n/a | 1682 | **PEAK** — warmup amortized over 7902 frames; pipeline reaches steady state; **GPU truly saturated**. Wall-clock 290s for 316s of footage → swap faster than realtime. |
+| 5 N=6 det_size=480 user live run (4712-frame clip, 2026-05-11) | **22-26 mid-stream** | — | n/a | n/a | n/a | — | — | active | n/a | — | User-observed during live HLS playback at frame ~1100/4712 (24%). Climbs with frame count as the pipeline fills its queues; reproduces the 30+ fps peak after warmup amortises. |
 | 6 (NVDEC input) | TBD | TBD | TBD | TBD | TBD | TBD | TBD | TBD | >0% | TBD | PyAV hwaccel=cuda |
 
 ## How rows are captured
