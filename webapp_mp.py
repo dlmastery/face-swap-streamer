@@ -1651,20 +1651,51 @@ function attachStream() {
     });
     hls.loadSource(url);
     hls.attachMedia(player);
-    // Don't auto-play on MANIFEST_PARSED — wait for buffer to fill instead.
+    // Multiple triggers — once any of these fires we attempt playback. The
+    // safety-net interval below covers the case where none of them fire
+    // (HLS buffer maxed out, no progress events because we're caught up, etc).
     hls.on(Hls.Events.BUFFER_APPENDED, tryStartPlayback);
+    hls.on(Hls.Events.MANIFEST_PARSED, tryStartPlayback);
+    hls.on(Hls.Events.FRAG_BUFFERED, tryStartPlayback);
+    hls.on(Hls.Events.LEVEL_LOADED, tryStartPlayback);
+    // Fatal HLS errors are recoverable — destroy + re-attach instead of
+    // requiring the user to refresh the page.
     hls.on(Hls.Events.ERROR, (_, data) => {
-      if (data.fatal) console.warn('hls fatal', data);
+      if (!data.fatal) return;
+      console.warn('hls fatal — recovering', data.type, data.details);
+      if (data.type === Hls.ErrorTypes.NETWORK_ERROR) {
+        hls.startLoad();
+      } else if (data.type === Hls.ErrorTypes.MEDIA_ERROR) {
+        hls.recoverMediaError();
+      } else {
+        try { hls.destroy(); } catch (e) {}
+        streamShown = false;
+        playStarted = false;
+        setTimeout(attachStream, 1000);
+      }
     });
   } else if (player.canPlayType('application/vnd.apple.mpegurl')) {
-    // Safari native HLS — same buffer-then-play idea via timeupdate
+    // Safari native HLS — same buffer-then-play idea via timeupdate.
     player.src = url;
     player.addEventListener('progress', tryStartPlayback);
+    player.addEventListener('canplay', tryStartPlayback);
+    player.addEventListener('loadeddata', tryStartPlayback);
   } else {
     errEl.classList.add('show');
     errEl.textContent = "Your browser doesn't support HLS. Try Chrome, Firefox, or Safari.";
     return;
   }
+  // Video-element-level triggers also fire (independent of HLS.js queue state).
+  player.addEventListener('canplay', tryStartPlayback);
+  player.addEventListener('canplaythrough', tryStartPlayback);
+  player.addEventListener('loadeddata', tryStartPlayback);
+  // Safety-net poller: every 500 ms while we haven't started, try again.
+  // Catches the case where every event-driven trigger has already fired and
+  // play() was rejected by the autoplay policy with no further events coming.
+  const _safety = setInterval(() => {
+    if (playStarted) { clearInterval(_safety); return; }
+    tryStartPlayback();
+  }, 500);
 
   // Stall handling: when the buffer drains (backend can't keep up), pause and
   // wait for a re-buffer instead of letting the player stutter every second.
