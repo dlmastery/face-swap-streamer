@@ -1697,6 +1697,26 @@ function attachStream() {
     tryStartPlayback();
   }, 500);
 
+  // Watchdog: if 10 seconds after attachStream we still have zero buffered
+  // and playback hasn't started, the HLS connection is wedged (likely because
+  // the playlist was 404'ing when we attached and HLS.js has burned through
+  // its retry budget). Destroy and re-attach — the equivalent of the user
+  // hitting refresh, but automatic.
+  const _attachedAt = Date.now();
+  let _watchdogReattached = false;
+  const _watchdog = setInterval(() => {
+    if (playStarted) { clearInterval(_watchdog); return; }
+    const age = Date.now() - _attachedAt;
+    if (age > 10000 && bufferedAhead() < 0.1 && !_watchdogReattached) {
+      console.warn('HLS attach stalled — destroying + re-attaching');
+      _watchdogReattached = true;
+      clearInterval(_watchdog);
+      try { if (hls) hls.destroy(); } catch (e) {}
+      streamShown = false;
+      setTimeout(attachStream, 500);
+    }
+  }, 2000);
+
   // Stall handling: when the buffer drains (backend can't keep up), pause and
   // wait for a re-buffer instead of letting the player stutter every second.
   player.addEventListener('waiting', () => {
@@ -1778,7 +1798,13 @@ async function poll() {
   }
 
   if ((r.phase === "streaming" || r.phase === "finalising" || r.phase === "done") && !streamShown) {
-    attachStream();
+    // Defer the HLS attach until the playlist actually exists. Without this,
+    // HLS.js can burn through its 60-retry budget on 404s before ffmpeg has
+    // had a chance to write the first segment, leaving the player wedged
+    // until the user hits browser refresh.
+    fetch(`/job/${JOB}/hls/playlist.m3u8`, { method: 'HEAD', cache: 'no-store' })
+      .then(resp => { if (resp.ok) attachStream(); })
+      .catch(() => {});
   }
 
   if (r.phase === "done") {
