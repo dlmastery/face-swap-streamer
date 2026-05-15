@@ -70,6 +70,9 @@ cli/models/
 cli/out_test/
 cli/out_batch/
 
+# --- Build artifacts (installer zip + staging tree)
+dist/
+
 # --- Misc
 *.tmp
 *.bak
