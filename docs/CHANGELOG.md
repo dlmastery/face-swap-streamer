@@ -44,7 +44,45 @@ ALL cluster members (not just the centroid). A face matching ANY one
 of the 30 member embeddings gets a stable high sim score. Memory cost:
 ~60 KB per source. Compute: one big GEMM per frame. Negligible.
 
-Default `FACESWAP_REF_THRESH` lowered from 0.18 → 0.15.
+Default `FACESWAP_REF_THRESH` lowered from 0.18 → 0.15, then to 0.12
+after the sample-pool bump.
+
+### Matching: cluster sample-pool bump 120 → 200 (no commit; bundled with margin-reject)
+
+NN-over-members only helps if the members actually cover the target's
+pose. The 120-sample default left each major cluster with ~30 members,
+which missed extreme poses (deep profile, mid-twirl, far-away). Bumping
+to 200 gives each major cluster ~50 members at typical lead screen-
+time, eliminating the residual single-frame flicker that NN-over-members
+alone couldn't fix.
+
+### Matching: margin-reject for wrong-source flicker (commit `4a8193c`)
+
+After NN-over-members + sample-pool=200 killed the "swap on/off" flicker,
+a new variant surfaced on **partial-pose male frames**: when the male
+face was half-visible (profile, occlusion, mid-twirl), its embedding
+drifted enough that the F source cluster narrowly beat the M source
+cluster (e.g. 0.14 F vs 0.13 M, both above the 0.12 threshold). `argmax`
+then painted the wrong-gender source onto a half-visible male for a few
+frames — far worse than a brief passthrough.
+
+Fix: after `argmax` picks a winning source, also compute the runner-up
+sim. If `top_sim - runner_up_sim < FACESWAP_MIN_MARGIN` (default `0.04`),
+treat the match as ambiguous and skip the swap entirely. The original
+frame passes through instead of getting the wrong gender painted on.
+
+Only fires when there are ≥2 sources (single-source jobs are unchanged
+since `argmax` over 1 column has no runner-up). Tuned with a tight
+threshold: on clean head-on shots the top-vs-runner gap is typically
+≥0.10, so legitimate swaps clear 0.04 easily; on ambiguous partial
+frames the gap collapses to <0.04 and we passthrough.
+
+Wired into `webapp.py` (`_detect_loop` for the single-process path) and
+`server/swap_worker.py::worker_main` (multiprocessing workers), with
+`webapp_mp.py` passing `MIN_MARGIN` through the spawn args.
+
+Tunable: `FACESWAP_MIN_MARGIN=0.06` for stricter (more passthrough),
+`0.02` for looser (residual flicker may return).
 
 ### Viewer: autoplay self-heal (commits `c0a0a45`, `d4e90a4`)
 

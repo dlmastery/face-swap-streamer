@@ -842,6 +842,45 @@ is read-only and you'll get
 Use `$id` or `$processId` instead. Same applies to `$HOME`, `$PWD`,
 and a few others.
 
+### 23. Multi-source matching: argmax alone is not enough — runner-up matters
+
+After NN-over-members and a 200-sample reference pool, a residual bug
+showed up on partial-pose male frames: the male face was half-visible,
+its embedding drifted, and the F source cluster narrowly beat the M
+source cluster (e.g. 0.14 F vs 0.13 M — both above the 0.12 threshold).
+`argmax` picked F → female source painted on a half-visible male →
+visually worse than a 1-frame passthrough.
+
+Fix in `webapp.py::_detect_loop` and
+`server/swap_worker.py::worker_main`: after `np.argmax(sims[ti])`, also
+compute the runner-up sim. If `top - runner_up < FACESWAP_MIN_MARGIN`
+(default `0.04`), the match is ambiguous — skip the swap (passthrough)
+instead of guessing wrong.
+
+```python
+si = int(np.argmax(sims[ti]))
+top_sim = float(sims[ti, si])
+if top_sim < ref_thresh:
+    continue
+if sims.shape[1] > 1:
+    sims_sorted = np.sort(sims[ti])[::-1]
+    if (top_sim - float(sims_sorted[1])) < min_margin:
+        continue
+# safe to swap with ref_sources[si]
+```
+
+Guard `shape[1] > 1`: single-source jobs have no runner-up and must
+keep argmax-then-threshold semantics.
+
+For `webapp_mp.py`, `MIN_MARGIN` is read in the master and passed
+through worker spawn args (between `ref_thresh` and `face_model`).
+Don't forget to thread it through both ends or the workers will
+TypeError on missing positional arg.
+
+Tunable via `FACESWAP_MIN_MARGIN`. 0.04 default was tuned so that
+clean head-on shots (top-vs-runner gap typically ≥0.10) easily clear
+the bar while partial poses (gap <0.04) passthrough.
+
 ---
 
 ## Troubleshooting matrix
