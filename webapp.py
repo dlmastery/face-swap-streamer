@@ -324,7 +324,10 @@ def _run_job(job: Job):
         # all_candidates: list of (score, embedding, frame_idx, per_frame_genderage_label)
         all_candidates: list = []
         i = 0
-        max_samples = 120
+        # 200 samples gives each major cluster ~50 members at typical lead
+        # screen-time, covering more pose variation (profile, dance, far-away)
+        # so NN-over-members has a representative to match against.
+        max_samples = 200
         while i < total and len(all_candidates) < max_samples:
             if job.stop_flag.is_set():
                 raise RuntimeError("cancelled")
@@ -440,10 +443,10 @@ def _run_job(job: Job):
         # embeddings, so 0.18 (down from 0.22) keeps far-away/blurry leads
         # in the swap. Override via env var if you see false-positive swaps
         # on extras — bump to 0.25 or 0.30 for stricter matching.
-        # 0.15 default: with the centroid (mean-of-cluster) reference embedding
-        # this captures the lead even on profile / wide / partially-occluded
-        # frames. Below 0.10 starts false-positiving on lookalike extras.
-        REFERENCE_THRESH = float(os.getenv("FACESWAP_REF_THRESH", "0.15"))
+        # 0.12 default: with NN-over-members the score floor is high enough
+        # that 0.12 still rejects extras while catching profile / motion-blur
+        # / wide-shot frames that were just below 0.15.
+        REFERENCE_THRESH = float(os.getenv("FACESWAP_REF_THRESH", "0.12"))
 
         # Pre-stack reference embeddings for fast per-frame matching against
         # all sources at once. We use NN-over-members rather than centroid sim
