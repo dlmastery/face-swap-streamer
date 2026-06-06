@@ -5,6 +5,99 @@ introduced them and the lessons each one taught.
 
 ---
 
+## v0.12 — Quality fixes + Pause/Resume UI + installable bundle
+
+This release is the hardening cycle on top of v0.11's multiprocessing
+core. Every fix is in `webapp_mp.py` and/or `server/swap_worker.py`.
+
+### Matching: M/F cross-swap fix (commits `096592d`, `cc441d3`)
+
+The old reference extractor grouped candidate faces by per-frame
+genderage label BEFORE clustering by identity. genderage is noisy
+(profile shots, lighting, hair) — the actress was often labeled "M",
+which polluted the M source's reference embedding with HER identity.
+Result: at swap time her female frames matched the (mislabeled-as-M)
+ref_emb and got the male source painted on. Classic M↔F cross-swap.
+
+Fix is two layers:
+
+1. **Identity-first clustering** (no gender filter at extraction). The
+   same person clusters together regardless of single-frame label noise.
+   Each cluster's gender is then assigned by MAJORITY VOTE of its
+   members — robust to ~30% mislabel rate.
+2. **Max-weight cluster→source assignment**. Across all permutations
+   of (source × cluster), pick the assignment that maximises
+   `Σ size(cluster) * gender_fraction(cluster, source.gender)`. The
+   actor's big cluster anchors the M source even when the actress's
+   cluster has a slightly-M-leaning majority. Brute force is fine —
+   K=12 cap means 12! at most.
+
+### Matching: NN-over-members fix (commit `c4f6cf9`)
+
+Centroid-only cosine matching was unstable. The actress's embedding at
+a given pose sat 0.10–0.14 sim with the cluster centroid (just below
+threshold), 0.18–0.22 a frame later (just above), back down — visible
+1-second on/off flicker.
+
+Fix: per target face, per source, take `max(tgt @ member_emb.T)` across
+ALL cluster members (not just the centroid). A face matching ANY one
+of the 30 member embeddings gets a stable high sim score. Memory cost:
+~60 KB per source. Compute: one big GEMM per frame. Negligible.
+
+Default `FACESWAP_REF_THRESH` lowered from 0.18 → 0.15.
+
+### Viewer: autoplay self-heal (commits `c0a0a45`, `d4e90a4`)
+
+`<video>.play()` rejected by Chrome's autoplay policy left the page
+stuck on "Buffering 0/4s" until the user hit refresh. The old code
+relied on HLS.js's `BUFFER_APPENDED` event only — when the buffer
+maxed out at 60 s, the event stopped firing, no further retry.
+
+Fix is three layers:
+
+1. **Defer `attachStream` until playlist HEAD = 200**. Without this
+   HLS.js can burn through 60 retries × 800 ms = 48 s on 404s while
+   ffmpeg is still warming up, leaving the player wedged.
+2. **`setInterval(500ms)` safety net** that keeps calling
+   `tryStartPlayback` until `playStarted = true`. Clears itself once
+   playback starts.
+3. **Watchdog re-attach** — 10 s after `attachStream` if the buffer
+   is still empty, destroy the HLS instance and re-attach. Equivalent
+   to a manual refresh, but automatic.
+
+### Viewer: Pause / Resume / Stop UX (commit `1bc6d02`)
+
+Three new buttons on the viewer page + three new endpoints. Pause
+sleeps the demux loop without dispatching new frames; workers drain
+their queues and idle; ffmpeg holds the pipe open. Resume picks up
+from the current cv2 cursor. Stop is hard-abort.
+
+### Packaging: v0.12-installer GitHub Release (commit `da3da26`)
+
+A 520 MB zip on GitHub Releases (`v0.12-installer`) that bundles
+`webapp_mp.py`, the worker, both ONNX model bundles (~590 MB → ~520
+zipped), an `install.ps1` that uses winget to set up Miniconda +
+ffmpeg + the conda env, and a `start.ps1` launcher.
+
+Target audience: a fresh Windows machine with an NVIDIA driver but
+nothing else. Install takes ~10–15 minutes, fully unattended.
+
+Source for the installer is in `installer/` and the build script in
+`tools/build-installer.ps1`.
+
+Download:
+https://github.com/dlmastery/face-swap-streamer/releases/tag/v0.12-installer
+
+### Planned next: `multi-face-swapper-streaming` repo
+
+A new repo currently in design (see
+`docs/plans/2026-05-16-multi-face-swapper-design.md`) that builds on
+this code with a face-grid UX: upload mp4 → scan identifies up to 12
+distinct faces → user assigns swap photos per face card → stream the
+result. Skipped faces pass through unswapped. Same pipeline underneath.
+
+---
+
 ## v0.11 — Multiprocessing webapp variant (33 fps at 1080p)
 
 **`webapp_mp.py`** and **`server/swap_worker.py`** — new files. Original

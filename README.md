@@ -35,6 +35,12 @@ inswapper, a **4-stage thread pipeline** that keeps the RTX GPU fed, and
 
 ---
 
+> **Just want to run it?** Grab the **v0.12 installable bundle**
+> (520 MB, fresh-Windows-ready, runs unattended):
+> https://github.com/dlmastery/face-swap-streamer/releases/tag/v0.12-installer
+> Unzip → `install.ps1` → `start.ps1` → http://localhost:8082.
+> Everything below is for developers building from source.
+
 ## What it does
 
 | | |
