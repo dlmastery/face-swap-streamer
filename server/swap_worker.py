@@ -221,6 +221,7 @@ def worker_main(
     det_size: int,              # face detector input (square)
     det_thresh: float,          # detector confidence threshold
     ref_thresh: float,          # cosine-sim threshold for source-match
+    min_margin: float,          # min sim gap between winning and runner-up source (anti-ambiguous-swap)
     models_face_dir: Optional[str],  # FACESWAP_FACE_MODEL or None
     inswapper_path: str,        # absolute path to inswapper_128_fp16.onnx
 ) -> None:
@@ -371,20 +372,32 @@ def worker_main(
                                 sims[:, s] = all_sims[:, cols].max(axis=1)
                     else:
                         sims = tgt_embs @ ref_embs_T      # fallback to centroid sim
+                    S = sims.shape[1]
                     for ti, tface in enumerate(tgt_faces):
                         si = int(np.argmax(sims[ti]))
-                        if float(sims[ti, si]) >= ref_thresh:
-                            # Fused swap+paste — same call shape as the
-                            # in-process Phase 2 path; matches its output byte-for-byte
-                            # (same model, same source face, same target face).
-                            swapped = sw.get(frame, tface,
-                                             ref_sources[si]["src_face"],
-                                             paste_back=True)
-                            # insightface returns a NEW ndarray for the swapped frame
-                            # (not in-place). Copy it back into the shared-memory slot
-                            # so the master sees the result without an extra IPC payload.
-                            frame[...] = swapped
-                            n_swapped += 1
+                        top_sim = float(sims[ti, si])
+                        if top_sim < ref_thresh:
+                            continue  # not similar enough to any cluster
+                        # Margin check: when 2+ sources are within min_margin of
+                        # each other, the match is ambiguous (typically partial
+                        # / profile / motion-blurred faces). Skip the swap
+                        # rather than guess and apply the wrong-gender source.
+                        if S > 1:
+                            sims_sorted = np.sort(sims[ti])[::-1]
+                            runner_up = float(sims_sorted[1])
+                            if (top_sim - runner_up) < min_margin:
+                                continue
+                        # Fused swap+paste — same call shape as the in-process
+                        # Phase 2 path; matches its output byte-for-byte (same
+                        # model, source face, target face).
+                        swapped = sw.get(frame, tface,
+                                         ref_sources[si]["src_face"],
+                                         paste_back=True)
+                        # insightface returns a NEW ndarray for the swapped frame
+                        # (not in-place). Copy it back into the shared-memory slot
+                        # so the master sees the result without an extra IPC payload.
+                        frame[...] = swapped
+                        n_swapped += 1
 
                 elapsed = (time.perf_counter() - tA) * 1000.0
                 out_q.put(SwapResponse(

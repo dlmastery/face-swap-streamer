@@ -511,6 +511,17 @@ def _run_job(job: Job):
         # on lookalike extras.
         REFERENCE_THRESH = float(os.getenv("FACESWAP_REF_THRESH", "0.12"))
 
+        # Margin between the winning source's sim and the runner-up. If two
+        # sources score within MIN_MARGIN of each other on a target face, the
+        # match is ambiguous (typically partial / profile / motion-blur frames
+        # where the face's embedding has drifted toward another cluster). In
+        # that case we skip the swap and let the original frame pass through
+        # rather than guess wrong and paint the wrong-gender face onto a
+        # partially-visible male in mid-twirl. 0.04 was tuned to suppress
+        # the residual flicker observed on partial poses without eating into
+        # legit swaps (top-vs-runner gap on clean head-on shots is ≥0.10).
+        MIN_MARGIN = float(os.getenv("FACESWAP_MIN_MARGIN", "0.04"))
+
         # Pre-stack reference embeddings for fast per-frame matching against
         # all sources at once.
         ref_embs = np.stack([s.ref_emb for s in job.sources])  # shape (S, D)
@@ -605,7 +616,7 @@ def _run_job(job: Job):
                     args=(
                         wid, in_q, out_q, shm_names, (in_h, in_w, 3),
                         ref_embs_bytes, ref_sources_pickled, ref_members_pickled,
-                        det_size, det_thresh, REFERENCE_THRESH,
+                        det_size, det_thresh, REFERENCE_THRESH, MIN_MARGIN,
                         face_model, SWAPPER_PATH,
                     ),
                     name=f"swap-worker-{wid}",

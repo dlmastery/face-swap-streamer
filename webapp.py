@@ -448,6 +448,16 @@ def _run_job(job: Job):
         # / wide-shot frames that were just below 0.15.
         REFERENCE_THRESH = float(os.getenv("FACESWAP_REF_THRESH", "0.12"))
 
+        # Margin between the winning source's sim and the runner-up. If two
+        # sources score within MIN_MARGIN of each other on a target face, the
+        # match is ambiguous (typically partial / profile / motion-blur frames
+        # where the embedding has drifted toward another cluster). Skip the
+        # swap in that case so the original frame passes through, rather than
+        # guess wrong and paint the wrong-gender face onto a partially-visible
+        # subject. 0.04 was tuned to suppress the residual flicker observed
+        # on partial poses without eating into legit swaps.
+        MIN_MARGIN = float(os.getenv("FACESWAP_MIN_MARGIN", "0.04"))
+
         # Pre-stack reference embeddings for fast per-frame matching against
         # all sources at once. We use NN-over-members rather than centroid sim
         # (much more robust to per-frame pose / lighting noise — kills the
@@ -519,10 +529,20 @@ def _run_job(job: Job):
                                     sims[:, s] = all_sims[:, cols].max(axis=1)
                         else:
                             sims = tgt_embs @ ref_embs.T              # fallback: centroid sim
+                        S_sims = sims.shape[1]
                         for ti, tface in enumerate(tgt_faces):
                             si = int(np.argmax(sims[ti]))
-                            if float(sims[ti, si]) >= REFERENCE_THRESH:
-                                picks.append((tface, si))
+                            top_sim = float(sims[ti, si])
+                            if top_sim < REFERENCE_THRESH:
+                                continue
+                            # Margin check: skip ambiguous matches (top vs
+                            # runner-up < MIN_MARGIN). Prevents wrong-source
+                            # swaps on partial-pose frames.
+                            if S_sims > 1:
+                                sims_sorted = np.sort(sims[ti])[::-1]
+                                if (top_sim - float(sims_sorted[1])) < MIN_MARGIN:
+                                    continue
+                            picks.append((tface, si))
                     detect_q.put((frame, picks))
             finally:
                 detect_q.put(END)
